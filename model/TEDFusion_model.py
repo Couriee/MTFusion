@@ -130,7 +130,10 @@ class FeatureWiseAffine(nn.Module):
 
         self.image_proj = nn.Linear(c_I, c_I)
         self.text_proj = nn.Linear(c_I, c_I)
-        self.reuse_registered_text_proj = False
+        # self.reuse_registered_text_proj = False
+        self.reuse_registered_text_proj = True
+        
+        
         # self.attn_proj = nn.Linear(c_I, c_I)
 
         self.eps = 1e-5
