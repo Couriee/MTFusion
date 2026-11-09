@@ -297,7 +297,7 @@ def main(args):
         tb_writer.add_scalar("train_color_loss", train_color_loss, epoch)
         tb_writer.add_scalar("train_text_loss", train_text_loss, epoch)
         tb_writer.add_scalar("train_semantic_loss", train_semantic_loss, epoch)
-        tb_writer.add_scalar("train_hyperbolic_loss", train_semantic_loss, epoch)
+        tb_writer.add_scalar("train_hyperbolic_loss", train_hyperbolic_loss, epoch)
 
         if epoch % args.val_every_epcho == 0 and epoch != 0:
             val_loss, val_ssim_loss, val_max_loss, val_color_loss, val_text_loss, val_semantic_loss, val_hyperbolic_loss = evaluate(model=model,
@@ -311,7 +311,7 @@ def main(args):
             tb_writer.add_scalar("val_color_loss", val_color_loss, epoch)
             tb_writer.add_scalar("val_text_loss", val_text_loss, epoch)
             tb_writer.add_scalar("val_semantic_loss", val_semantic_loss, epoch)
-            tb_writer.add_scalar("val_hyperbolic_loss", val_semantic_loss, epoch)
+            tb_writer.add_scalar("val_hyperbolic_loss", val_hyperbolic_loss, epoch)
 
             is_best = val_loss < best_val_loss
             if is_best:

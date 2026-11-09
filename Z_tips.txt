@@ -1,0 +1,11 @@
+=======1=======
+train_semantic_loss -> train_hyperbolic_loss
+
+已修正 [train_fusion.py](</E:/考研资料/复试/T/MTFusion/train_fusion.py:300>) 的两处记录变量：
+
+- 训练：`train_semantic_loss` → `train_hyperbolic_loss`
+- 验证：`val_semantic_loss` → `val_hyperbolic_loss`
+
+TensorBoard 现在会记录实际双曲损失。本次仅改这两行，不影响损失计算，语法检查通过。
+
+=======2=======
