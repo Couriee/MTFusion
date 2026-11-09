@@ -1,0 +1,1 @@
+python train_fusion.py   --dataset_path "./dataset/MSRS_split"   --samples_per_epoch 800   --epochs 25   --lr 1e-4   --weight_decay 1e-4   --grad_clip_norm 1.0
