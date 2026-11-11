@@ -460,7 +460,12 @@ class TEDFusion(nn.Module):
         # feature = self.fc2(feature)
         # feature = torch.sigmoid(feature)
 
-        feature = feature.unsqueeze(0).expand(text1.size(0), -1)
+        if feature.ndim == 1 and b == 1:
+            feature = feature.unsqueeze(0)
+        if feature.shape != (b, 8):
+            raise ValueError("Expected per-image attributes [{},8], got {}".format(
+                b, tuple(feature.shape)
+            ))
 
         f1,f2,f3,f4 = feature.chunk(4, dim=1)
 
@@ -736,7 +741,12 @@ class TEDFusion1(nn.Module):
 
     def forward(self, inp_img_A, inp_img_B,feature):
         b = inp_img_A.shape[0]
-        feature = feature.unsqueeze(0).expand(inp_img_A.size(0), -1)
+        if feature.ndim == 1 and b == 1:
+            feature = feature.unsqueeze(0)
+        if feature.shape != (b, 8):
+            raise ValueError("Expected per-image attributes [{},8], got {}".format(
+                b, tuple(feature.shape)
+            ))
 
         # ATGFM inference: attributes replace the unavailable text branch.
         f1, f2, f3, f4 = feature.chunk(4, dim=1)

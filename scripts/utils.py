@@ -185,43 +185,32 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         text2 = clip.tokenize(captions2).to(args.device)
 
 
+        _check_rgb_batch(I_A)
+        _check_rgb_batch(I_B)
+        if I_A.shape != I_B.shape:
+            raise ValueError("Paired image shapes must match, got {} and {}".format(
+                tuple(I_A.shape), tuple(I_B.shape)
+            ))
+
         h1, s1, v1 = mergy_RGB_to_HSV(I_A)
-        s_avg1 = calculate_edge(I_A)
-
-        v_avg1 = np.mean(v1)
-        gray_tensor1 = rgb_to_gray(I_A)
-        gray_tensor1 = torch.sum(gray_tensor1, dim=0)
-        gray_tensor1 = torch.sum(gray_tensor1, dim=1)
-        gray_tensor1 = (gray_tensor1.detach().cpu().numpy() * 255).astype(np.uint8)
-        glcm1 = graycomatrix(gray_tensor1, [2, 4, 8, 16], [0, np.pi / 4, np.pi / 2, np.pi * 3 / 4],
-                            256, symmetric=True, normed=True)
-        glcm1 = np.array(glcm1, dtype=np.float32)
-
-        energy1 = graycoprops(glcm1, 'energy')
-        energy_avg1 = np.mean(energy1)
-        homogeneity1 = graycoprops(glcm1, 'homogeneity')
-        homogeneity_avg1 = np.mean(homogeneity1)
-        glcm1 = torch.from_numpy(glcm1)
-        texture_complexity1 = 0.7 * energy_avg1 + 0.3 * homogeneity_avg1
-        contrast1 = calculate_contrast(I_A).detach().cpu().numpy()
+        s_avg1 = s1.mean(axis=(1, 2))
+        v_avg1 = v1.mean(axis=(1, 2))
+        texture_complexity1 = _texture_complexity(I_A, (0.7, 0.3))
+        contrast1 = calculate_contrast(I_A.detach()).cpu().numpy()
 
         h2, s2, v2 = mergy_RGB_to_HSV(I_B)
-        s_avg2 = calculate_edge(I_B)
-        v_avg2 = np.mean(v2)
-        gray_tensor2 = rgb_to_gray(I_B)
-        gray_tensor2 = torch.sum(gray_tensor2, dim=0)
-        gray_tensor2 = torch.sum(gray_tensor2, dim=1)
-        gray_tensor2 = (gray_tensor2.detach().cpu().numpy() * 255).astype(np.uint8)
-        glcm2 = graycomatrix(gray_tensor2, [2, 4, 8, 16], [0, np.pi / 4, np.pi / 2, np.pi * 3 / 4],
-                             256, symmetric=True, normed=True)
-        glcm2 = np.array(glcm2, dtype=np.float32)
-        energy2 = graycoprops(glcm2, 'energy')
-        energy_avg2 = np.mean(energy2)
-        homogeneity2 = graycoprops(glcm2, 'homogeneity')
-        homogeneity_avg2 = np.mean(homogeneity2)
-        glcm2 = torch.from_numpy(glcm2)
-        texture_complexity2 = 0.6 * energy_avg2 + 0.4 * homogeneity_avg2
-        contrast2 = calculate_contrast(I_B).detach().cpu().numpy()
+        s_avg2 = s2.mean(axis=(1, 2))
+        v_avg2 = v2.mean(axis=(1, 2))
+        texture_complexity2 = _texture_complexity(I_B, (0.6, 0.4))
+        contrast2 = calculate_contrast(I_B.detach()).cpu().numpy()
+
+        feature = torch.as_tensor(
+            np.stack([
+                s_avg1, v_avg1, texture_complexity1, contrast1,
+                s_avg2, v_avg2, texture_complexity2, contrast2,
+            ], axis=1).astype(np.float32),
+            dtype=torch.float32, device=I_A.device,
+        )
 
 
         if torch.cuda.is_available():
@@ -230,10 +219,7 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
             I_A_gt = I_A_gt.to(device)
             I_B_gt = I_B_gt.to(device)
 
-        feature = np.stack([s_avg1, v_avg1, texture_complexity1, contrast1,s_avg2, v_avg2, texture_complexity2, contrast2], axis=-1)
-        feature = torch.tensor(feature)
-        feature = feature.to("cuda:0")
-        feature = feature.float()
+        feature = feature.to(I_A.device)
 
         # print(feature)
 
@@ -341,41 +327,32 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
 
         ####################################################################################################
 
+        _check_rgb_batch(I_A)
+        _check_rgb_batch(I_B)
+        if I_A.shape != I_B.shape:
+            raise ValueError("Paired image shapes must match, got {} and {}".format(
+                tuple(I_A.shape), tuple(I_B.shape)
+            ))
+
         h1, s1, v1 = mergy_RGB_to_HSV(I_A)
-        s_avg1 = np.mean(s1)
-        v_avg1 = np.mean(v1)
-        gray_tensor1 = rgb_to_gray(I_A)
-        gray_tensor1 = torch.sum(gray_tensor1, dim=0)
-        gray_tensor1 = torch.sum(gray_tensor1, dim=1)
-        gray_tensor1 = (gray_tensor1.detach().cpu().numpy() * 255).astype(np.uint8)
-        glcm1 = graycomatrix(gray_tensor1, [2, 4, 8, 16], [0, np.pi / 4, np.pi / 2, np.pi * 3 / 4],
-                             256, symmetric=True, normed=True)
-        glcm1 = np.array(glcm1, dtype=np.float32)
-        energy1 = graycoprops(glcm1, 'energy')
-        energy_avg1 = np.mean(energy1)
-        homogeneity1 = graycoprops(glcm1, 'homogeneity')
-        homogeneity_avg1 = np.mean(homogeneity1)
-        glcm1 = torch.from_numpy(glcm1)
-        texture_complexity1 = 0.7 * energy_avg1 + 0.3 * homogeneity_avg1
-        contrast1 = calculate_contrast(I_A).detach().cpu().numpy()
+        s_avg1 = s1.mean(axis=(1, 2))
+        v_avg1 = v1.mean(axis=(1, 2))
+        texture_complexity1 = _texture_complexity(I_A, (0.7, 0.3))
+        contrast1 = calculate_contrast(I_A.detach()).cpu().numpy()
 
         h2, s2, v2 = mergy_RGB_to_HSV(I_B)
-        s_avg2 = np.mean(s2)
-        v_avg2 = np.mean(v2)
-        gray_tensor2 = rgb_to_gray(I_B)
-        gray_tensor2 = torch.sum(gray_tensor2, dim=0)
-        gray_tensor2 = torch.sum(gray_tensor2, dim=1)
-        gray_tensor2 = (gray_tensor2.detach().cpu().numpy() * 255).astype(np.uint8)
-        glcm2 = graycomatrix(gray_tensor2, [2, 4, 8, 16], [0, np.pi / 4, np.pi / 2, np.pi * 3 / 4],
-                             256, symmetric=True, normed=True)
-        glcm2 = np.array(glcm2, dtype=np.float32)
-        energy2 = graycoprops(glcm2, 'energy')
-        energy_avg2 = np.mean(energy2)
-        homogeneity2 = graycoprops(glcm2, 'homogeneity')
-        homogeneity_avg2 = np.mean(homogeneity2)
-        glcm2 = torch.from_numpy(glcm2)
-        texture_complexity2 = 0.6 * energy_avg2 + 0.4 * homogeneity_avg2
-        contrast2 = calculate_contrast(I_B).detach().cpu().numpy()
+        s_avg2 = s2.mean(axis=(1, 2))
+        v_avg2 = v2.mean(axis=(1, 2))
+        texture_complexity2 = _texture_complexity(I_B, (0.6, 0.4))
+        contrast2 = calculate_contrast(I_B.detach()).cpu().numpy()
+
+        feature = torch.as_tensor(
+            np.stack([
+                s_avg1, v_avg1, texture_complexity1, contrast1,
+                s_avg2, v_avg2, texture_complexity2, contrast2,
+            ], axis=1).astype(np.float32),
+            dtype=torch.float32, device=I_A.device,
+        )
 
 
         if torch.cuda.is_available():
@@ -385,10 +362,7 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
             I_B_gt = I_B_gt.to(device)
             I_full = I_full.to(device)
 
-        feature = np.stack([s_avg1, v_avg1, texture_complexity1, contrast1,s_avg2, v_avg2, texture_complexity2, contrast2], axis=-1)
-        feature = torch.tensor(feature)
-        feature = feature.to("cuda:0")
-        feature = feature.float()
+        feature = feature.to(I_A.device)
 
 
 
@@ -497,23 +471,64 @@ def tensor2numpy_single(L_tensor):
     return L_3
 
 
-def mergy_RGB_to_HSV(img):  # [4,3,96,96]
+def _check_rgb_batch(images):
+    if images.ndim != 4 or images.shape[1] != 3 or images.shape[0] == 0:
+        raise ValueError("Expected a nonempty RGB batch [B,3,H,W], got {}".format(
+            tuple(images.shape)
+        ))
 
-    batch_size, channels, height, width = img.shape
-    img_numpy = img.cpu().numpy()
-    hsv_images = []
-    for i in range(batch_size):
-        single_img = np.transpose(img_numpy[i], [1, 2, 0])
-        img_HSV = cv2.cvtColor(single_img, cv2.COLOR_RGB2HSV)
-        H, S, V = cv2.split(img_HSV)
 
-    return H, S, V
+def mergy_RGB_to_HSV(img):
+    """Return H, S and V arrays, each with shape [B,H,W]."""
+    _check_rgb_batch(img)
+    images = img.detach().cpu().float().numpy()
+    hsv = np.stack([
+        cv2.cvtColor(image.transpose(1, 2, 0), cv2.COLOR_RGB2HSV)
+        for image in images
+    ], axis=0)
+    return hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
 
 def rgb_to_gray(rgb_tensor):
-    r, g, b = rgb_tensor[:, 0, :, :], rgb_tensor[:, 1, :, :], rgb_tensor[:, 2, :, :]
-    gray_tensor = 0.2989 * r + 0.5870 * g + 0.1140 * b
-    return gray_tensor.unsqueeze(1)
+    r, g, b = rgb_tensor[:, 0], rgb_tensor[:, 1], rgb_tensor[:, 2]
+    return (0.2989 * r + 0.5870 * g + 0.1140 * b).unsqueeze(1)
+
+
+def calculate_contrast(tensor):
+    """Return the mean channel-wise spatial standard deviation per image [B]."""
+    mean = tensor.mean(dim=(2, 3), keepdim=True)
+    var = ((tensor - mean) ** 2).mean(dim=(2, 3))
+    return torch.sqrt(var).mean(dim=1)
+
+
+def calculate_edge(tensor):
+    """Return mean spatial-gradient magnitude per image [B], for H,W >= 2."""
+    if tensor.ndim != 4 or min(tensor.shape[-2:]) < 2:
+        raise ValueError("Expected [B,C,H,W] with H,W >= 2, got {}".format(
+            tuple(tensor.shape)
+        ))
+    images = tensor.detach().cpu().float().numpy()
+    grad_y, grad_x = np.gradient(images, axis=(-2, -1))
+    magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
+    return magnitude.mean(axis=(1, 2, 3))
+
+
+def _texture_complexity(images, weights):
+    """Apply the existing single-image GLCM calculation independently."""
+    values = []
+    for image in images.detach():
+        # Preserve the original B=1 spatial reduction and quantization. Only
+        # remove aggregation across different batch samples in this repair.
+        gray = rgb_to_gray(image.unsqueeze(0)).sum(dim=0).sum(dim=1)
+        gray = (gray.cpu().numpy() * 255).astype(np.uint8)
+        glcm = graycomatrix(
+            gray, [2, 4, 8, 16], [0, np.pi / 4, np.pi / 2, np.pi * 3 / 4],
+            256, symmetric=True, normed=True,
+        ).astype(np.float32)
+        energy = graycoprops(glcm, 'energy').mean()
+        homogeneity = graycoprops(glcm, 'homogeneity').mean()
+        values.append(weights[0] * energy + weights[1] * homogeneity)
+    return np.asarray(values, dtype=np.float32)
 
 
 def gray_cooccurrence(image, window_size=1):
@@ -541,25 +556,3 @@ def gray_cooccurrence(image, window_size=1):
     norm_matrix = cooccurrence_matrix / (width * height - window_size ** 2 + 1)
 
     return norm_matrix
-
-
-def calculate_contrast(tensor):
-    # 计算每个通道的标准差作为对比度的近似
-    mean = tensor.mean(dim=(2, 3), keepdim=True)
-    var = ((tensor - mean) ** 2).mean(dim=(2, 3), keepdim=True)
-    std = torch.sqrt(var)
-    return std.mean()
-
-
-def calculate_edge(tensor):
-    # 计算水平和垂直梯度
-    grad_x = np.gradient(tensor, axis=1)  # 水平方向梯度
-    grad_y = np.gradient(tensor, axis=0)  # 垂直方向梯度
-
-    # 计算梯度幅值（欧几里得范数）
-    gradient_magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
-
-    # 计算边缘强度（取梯度幅值的均值）
-    edge_strength = np.mean(gradient_magnitude)
-
-    return edge_strength
