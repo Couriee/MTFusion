@@ -66,7 +66,7 @@ def main(args):
         model_weights.pop("conv48to384.bias", None)
         del checkpoint
 
-        model_clip, _ = clip.load("ViT-B/32", device=device)
+        model_clip, _ = clip.load("ViT-B/32", device=device, download_root=os.path.dirname(os.path.realpath(__file__)))
         model = create_model1(model_clip, curvature=curvature).to(device)
         model.load_state_dict(model_weights)
         del model_weights
