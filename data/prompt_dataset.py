@@ -1,7 +1,7 @@
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
-import os
+from pathlib import Path
 import random
 
 class PromptDataSet(Dataset):
@@ -113,7 +113,7 @@ class PromptDataSet(Dataset):
         if self.transform is not None:
             image_A, image_B, image_A_gt, image_B_gt, image_full = self.transform(image_A, image_B, image_A_gt, image_B_gt, image_full)
 
-        name = image_A_path.replace("\\", "/").split("/")[-1].split(".")[0]
+        name = Path(image_A_path).stem
 
         return image_A, image_B, image_A_gt, image_B_gt, image_full, task_key, name
 

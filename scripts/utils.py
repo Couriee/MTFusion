@@ -14,6 +14,7 @@ import colorsys
 from skimage.feature import graycomatrix, graycoprops
 from skimage import io
 
+from scripts.image_output import existing_image_names, reserve_image_stem, write_image
 from scripts.losses import fusion_prompt_loss
 import torch
 from transformers import BlipProcessor, BlipForConditionalGeneration
@@ -290,14 +291,15 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
     save_length = 60
     cnt = 0
     save_RGB_fuse = True
+    output_endings = (".png", "vis.png", "ir.png") if save_RGB_fuse else (".png",)
 
     if torch.cuda.is_available():
         loss_function_prompt = loss_function_prompt.to(device)
 
     if epoch % save_epoch == 0:
         evalfold_path = os.path.join(filefold_path, str(epoch))
-        if os.path.exists(evalfold_path) is False:
-            os.makedirs(evalfold_path)
+        os.makedirs(evalfold_path, exist_ok=True)
+        used_output_names = existing_image_names(evalfold_path)
 
     data_loader = tqdm(data_loader, file=sys.stdout)
     for step, data in enumerate(data_loader):
@@ -374,10 +376,11 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
                 img_full = tensor2numpy(I_full)
                 img_ir = tensor2numpy(I_B_gt)
 
-                save_pic(fused_img_Y, evalfold_path, str(name[0]))
+                output_stem = reserve_image_stem(str(name[0]), output_endings, used_output_names)
+                save_pic(fused_img_Y, evalfold_path, output_stem)
                 if save_RGB_fuse == True:
-                    save_pic(img_full, evalfold_path, str(name[0]) + "vis")
-                    save_pic(img_ir, evalfold_path, str(name[0]) + "ir")
+                    save_pic(img_full, evalfold_path, output_stem + "vis")
+                    save_pic(img_ir, evalfold_path, output_stem + "ir")
                 cnt += 1
 
         loss, loss_ssim, loss_max, loss_color, loss_text, loss_semantic,loss_hyperbolic = loss_function_prompt(I_A_gt, I_B_gt, I_fused,htext,hattr,distance_all, task)
@@ -440,7 +443,7 @@ def save_pic(outputpic, path, index: str):
     outputpic = np.rint(outputpic * 255.0).astype(np.uint8)
     outputpic = outputpic[:, :, ::-1]
     save_path = os.path.join(path, index + ".png")
-    cv2.imwrite(save_path, outputpic)
+    write_image(save_path, outputpic)
 
 
 def show_img(images, imagesl, B):

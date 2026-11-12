@@ -5,261 +5,122 @@ import numbers
 import math
 from einops import rearrange
 import numpy as np
-from args_fusion import args
-
-def hyperbolic_projection(x):
-    return x / (x.norm(dim=-1, keepdim=True) + 1)
 
 
+def validate_curvature(curvature):
+    if not math.isfinite(curvature) or curvature <= 0:
+        raise ValueError("Curvature must be finite and strictly positive.")
+    return curvature
 
-
-def poincare_distance(u, v):
-    c = torch.tensor(1.0).to(args.device)
-    eps = torch.tensor(1e-5).to(args.device)
-    """计算庞加莱球中的双曲距离"""
-    # 稳定化计算（防止除零）
-    u_norm = u.norm(dim=-1, p=2, keepdim=True).clamp_min(eps)
-    v_norm = v.norm(dim=-1, p=2, keepdim=True).clamp_min(eps)
-
-    # 计算欧式距离差
-    delta = torch.norm(u - v, dim=-1, p=2, keepdim=True)
-
-    # 双曲距离公式
-    denominator = (1 - c * u_norm ** 2) * (1 - c * v_norm ** 2)
-    return (2 / torch.sqrt(c)) * torch.acosh(
-        1 + 2 * c * delta ** 2 / denominator.clamp_min(eps)
-    )
-
-
-def hyperbolic_norm(x):
-    c = torch.tensor(1.0).to(args.device)
-    eps = torch.tensor(1e-5).to(args.device)
-    """计算双曲范数（到原点的距离）"""
-    x_norm = x.norm(dim=-1, p=2).clamp_min(eps)
-    return (2 / torch.sqrt(torch.tensor(c))) * torch.atanh(torch.sqrt(c) * x_norm)
 
 def safe_project(x, c=1.0):
-    """Project features to Poincaré ball to avoid NaN."""
-    c = torch.clamp_min(c, 1e-8)
-    max_norm = (1 - 1e-5) / torch.sqrt(c)  # Slightly below boundary
-    norm = torch.norm(x, dim=-1, keepdim=True)
-    scale = torch.minimum(max_norm / norm, torch.ones_like(norm))
-    return x * scale
+    """Keep each channel vector inside the Poincare ball."""
+    margin = max(1e-5, torch.finfo(x.dtype).eps)
+    max_norm = (1.0 - margin) / torch.as_tensor(c, device=x.device, dtype=x.dtype).sqrt()
+    norm = x.norm(dim=-1, keepdim=True).clamp_min(torch.finfo(x.dtype).eps)
+    return x * (max_norm / norm).clamp(max=1.0)
 
 
-def poincare_loss(img_feats, txt_feats):
-    # 调整tau值避免权重极端化
-    tau = torch.tensor(0.5).to(img_feats.device)  # 从0.1增加到0.5，避免权重极端
-
-    # 检查输入维度
-    if len(img_feats.shape) != 3 or len(txt_feats.shape) != 3:
-        raise ValueError(f"Expected 3D tensors, got img_feats:{img_feats.shape}, txt_feats:{txt_feats.shape}")
-
-    # 使用相同的曲率参数c，确保特征在同一双曲空间
-    c = torch.tensor(1.0, device=img_feats.device, dtype=img_feats.dtype)
-    c = torch.clamp_min(c, 1e-4)  # 增加最小值避免数值问题
-
-    # 投影到有效范围
-    img_feats = safe_project(img_feats, c)
-    txt_feats = safe_project(txt_feats, c)
-
-    # 1. 计算双曲范数差
-    img_norms = hyperbolic_norm(img_feats)  # [B,N]
-    txt_norms = hyperbolic_norm(txt_feats)  # [B,1]
-    norm_diff = torch.abs(img_norms - txt_norms)  # [B,N]
-
-    # 2. 计算自适应权重（添加数值稳定性）
-    norm_diff = torch.clamp(norm_diff, min=1e-8, max=5.0)  # 限制范围避免极端值
-    weights = torch.exp(-norm_diff / tau)  # [B,N]
-
-    # 检查权重是否正常
-    if torch.any(weights.isnan()) or torch.any(weights.isinf()):
-        print(f"Warning: Invalid weights detected. min:{weights.min():.6f}, max:{weights.max():.6f}")
-        weights = torch.clamp(weights, min=1e-8, max=1.0)
-
-    # 3. 计算双曲距离
-    # 扩展文本特征以匹配图像特征维度
-    txt_feats_expanded = txt_feats.expand_as(img_feats)
-    distances = poincare_distance(img_feats, txt_feats_expanded)  # [B,N,1] 或 [B,N]
-
-    # 如果距离是3D，压缩最后一维
-    if distances.dim() == 3 and distances.shape[-1] == 1:
-        distances = distances.squeeze(-1)  # [B,N]
-
-    # 检查距离是否正常
-    if torch.any(distances.isnan()) or torch.any(distances.isinf()):
-        print(f"Warning: Invalid distances detected. min:{distances.min():.6f}, max:{distances.max():.6f}")
-        distances = torch.clamp(distances, min=0.0, max=10.0)
-
-    # 4. 加权平均（添加权重归一化）
-    weights_sum = weights.sum(dim=1, keepdim=True)  # [B,1]
-    weights_sum = torch.clamp(weights_sum, min=1e-8)  # 避免除零
-    normalized_weights = weights / weights_sum  # [B,N]
-
-    # 计算加权损失
-    loss = (normalized_weights * distances).sum(dim=1).mean()  # 标量
-
-    # 调试输出（训练初期可开启）
-    if torch.isnan(loss) or torch.isinf(loss):
-        print(f"DEBUG - loss:{loss:.6f}, weights mean:{weights.mean():.6f}, "
-              f"distances mean:{distances.mean():.6f}, "
-              f"norm_diff mean:{norm_diff.mean():.6f}")
-        # 返回一个安全值
-        return torch.tensor(0.0, device=img_feats.device, requires_grad=True)
-
-    return loss
+def exp_map(tangent, c):
+    radius = c.sqrt() * tangent.norm(dim=-1, keepdim=True)
+    eps = torch.finfo(tangent.dtype).eps
+    scale = torch.where(radius < eps, 1.0, radius.tanh() / radius.clamp_min(eps))
+    return safe_project(tangent * scale, c)
 
 
-##########################################################################
-## Feature Modulation
+def log_map(point, c):
+    radius = c.sqrt() * point.norm(dim=-1, keepdim=True)
+    eps = torch.finfo(point.dtype).eps
+    scale = torch.where(radius < eps, 1.0, radius.atanh() / radius.clamp_min(eps))
+    return point * scale
+
+
+def mobius_translation(image, anchor, c):
+    """Translate by the negative anchor using equation (2)."""
+    difference = image - anchor
+    image_slack = 1 - c * image.square().sum(dim=-1, keepdim=True)
+    anchor_slack = 1 - c * anchor.square().sum(dim=-1, keepdim=True)
+    squared_difference = c * difference.square().sum(dim=-1, keepdim=True)
+    # Algebraically equivalent to the dot-product form. This denominator
+    # avoids subtracting nearly equal terms near the boundary of the ball.
+    numerator = image_slack * difference + squared_difference * image
+    denominator = image_slack * anchor_slack + squared_difference
+    return safe_project(numerator / denominator, c)
+
+
+def poincare_distance(u, v, c=1.0):
+    """Poincare distance in its numerically stable asinh form."""
+    c = torch.as_tensor(c, device=u.device, dtype=u.dtype)
+    sqrt_c = c.sqrt()
+    u_slack = 1 - c * u.square().sum(dim=-1)
+    v_slack = 1 - c * v.square().sum(dim=-1)
+    delta = (u - v).norm(dim=-1)
+    return (2 / sqrt_c) * torch.asinh(sqrt_c * delta / (u_slack * v_slack).sqrt())
+
+
+def hyperbolic_norm(x, c=1.0):
+    sqrt_c = torch.as_tensor(c, device=x.device, dtype=x.dtype).sqrt()
+    return (2 / sqrt_c) * torch.atanh(sqrt_c * x.norm(dim=-1))
+
+
+def poincare_loss(translated, anchor, c, tau=0.5):
+    """One weighted distance per image and scale, following equations (3)-(4)."""
+    image_norm = hyperbolic_norm(translated, c).mean(dim=1)
+    anchor_norm = hyperbolic_norm(anchor, c).squeeze(1)
+    weight = torch.exp(-(image_norm - anchor_norm).abs() / tau)
+    return weight * poincare_distance(translated, anchor, c).mean(dim=1)
+
+
+def shared_text_anchor(condition, guidance_levels):
+    # All scales use the same fixed curvature. Keep the four legacy parameter
+    # slots so existing model and optimizer checkpoints retain their layout.
+    dtype = torch.float64 if condition.dtype == torch.float64 else torch.float32
+    log_curvature = torch.stack([level.log_c.to(dtype=dtype) for level in guidance_levels]).mean()
+    curvature = log_curvature.exp()
+    anchor_width = guidance_levels[0].image_proj.out_features
+    projections = [
+        level.project_text(condition).to(dtype=dtype).reshape(condition.shape[0], -1, anchor_width).mean(dim=1)
+        for level in guidance_levels
+    ]
+    anchor = exp_map(torch.stack(projections).mean(dim=0).unsqueeze(1), curvature)
+    return anchor, curvature
+
+
 class FeatureWiseAffine(nn.Module):
-    def __init__(self, in_channels, out_channels, c_I, use_affine_level=True):
-        super(FeatureWiseAffine, self).__init__()
-        self.use_affine_level = use_affine_level
+    def __init__(self, in_channels, channels, curvature=1.0):
+        super().__init__()
         self.MLP = nn.Sequential(
             nn.Linear(in_channels, in_channels * 2),
             nn.LeakyReLU(),
-            nn.Linear(in_channels * 2, out_channels * (1 + self.use_affine_level))
+            nn.Linear(in_channels * 2, channels * 2),
         )
+        self.log_c = nn.Parameter(torch.tensor(math.log(validate_curvature(curvature))), requires_grad=False)
+        self.image_proj = nn.Linear(channels, channels)
+        self.text_proj = nn.Linear(channels, channels)
 
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # The caller resolves curvature from checkpoint metadata or an explicit
+        # experiment setting. Old checkpoints carry unused log_c values here.
+        key = prefix + "log_c"
+        if key in state_dict:
+            state_dict[key] = self.log_c.detach()
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-        self.img_proj = None
+    def project_text(self, condition):
+        gamma, _ = self.MLP(condition).chunk(2, dim=-1)
+        return self.text_proj(gamma)
 
-        self.log_c = nn.Parameter(torch.tensor(math.log(1.0)))
-
-        self.image_proj = nn.Linear(c_I, c_I)
-        self.text_proj = nn.Linear(c_I, c_I)
-        # self.reuse_registered_text_proj = False
-        self.reuse_registered_text_proj = True
-        
-        
-        # self.attn_proj = nn.Linear(c_I, c_I)
-
-        self.eps = 1e-5
-        self.c = torch.tensor(1).to(args.device)
-        self.ttt = 1
-
-    def mobius_add(self, x, y, c=1.0, eps=1e-5):
-        """Möbius 加法: x ⊕_c y"""
-        x_norm = torch.norm(x, dim=-1, keepdim=True)
-        y_norm = torch.norm(y, dim=-1, keepdim=True)
-        xy_dot = torch.sum(x * y, dim=-1, keepdim=True)
-        numerator = (1 + 2 * c * xy_dot + c * y_norm ** 2) * x + (1 - c * x_norm ** 2) * y
-        denominator = 1 + 2 * c * xy_dot + c ** 2 * x_norm ** 2 * y_norm ** 2 + eps
-        return numerator / denominator
-
-    def mobius_translation(self, x, t, c=1.0):
-        """Möbius平移"""
-        # 1. 记录原始值范围（按通道）
-        min_val = x.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]
-        max_val = x.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
-
-        # 2. 归一化到双曲空间安全范围（-0.9, 0.9）
-        x_normed = (x - min_val) / (max_val - min_val + 1e-7) * 1.8 - 0.9
-
-        # 3. 执行Möbius平移（保持原逻辑）
-        neg_t = -t.unsqueeze(2).permute(0, 2, 1)  # [batch, 1, D]
-
-        translated = self.mobius_add(x_normed, neg_t, c=c)
-
-        # 4. 反归一化到原始范围
-        translated = (translated + 0.9) / 1.8 * (max_val - min_val) + min_val
-        return translated.permute(0, 2, 1).clamp(min_val, max_val)  # 硬截断保护
-
-    def mobius_mul(self, r, x, c=1.0):
-        c = torch.tensor(1.0, device=x.device, dtype=x.dtype)
-        c = torch.clamp_min(c, 1e-8)
-
-        # Project inputs and clamp r
-        x = safe_project(x, c)
-        r = torch.clamp(r, -5.0, 5.0)  # Prevent extreme scaling
-
-        x_norm = torch.norm(x, dim=-1, keepdim=True).clamp_min(1e-8)
-        if r.dim() > 0:
-            r = r.view(*r.shape, *([1] * (x.dim() - r.dim())))
-
-        sqrt_c = torch.sqrt(c)
-        atanh_input = torch.clamp(sqrt_c * x_norm, -0.999, 0.999)  # Avoid atanh(1)=inf
-        atanh_term = torch.atanh(atanh_input)
-        scale = torch.tanh(r * atanh_term) / (sqrt_c * x_norm)
-
-        return scale * x
-
-    def exp_map(self, v):
-        """指数映射 exp_0^c(v)"""
-        v_norm = torch.norm(v, dim=-1, keepdim=True)  # [..., 1]
-        sqrt_c = torch.sqrt(torch.tensor(self.c, device=v.device))
-
-        # 计算缩放因子
-        scale = torch.tanh(sqrt_c * v_norm) / (sqrt_c * v_norm + self.eps)
-
-        # 归一化处理
-        return scale * v
-
-    def log_map(self, y):
-        """对数映射 log_0^c(y)"""
-        y_norm = torch.norm(y, dim=-1, keepdim=True)  # [..., 1]
-        sqrt_c = torch.sqrt(torch.tensor(self.c, device=y.device))
-
-        # 计算缩放因子
-        atanh_term = torch.atanh(sqrt_c * y_norm.clamp(max=1 - self.eps))  # 防止输入接近1
-        scale = atanh_term / (sqrt_c * y_norm + self.eps)
-
-        # 归一化处理
-        return scale * y
-
-    def forward(self, x, text_embed):
-        b_image, c_image, height, width = x.shape
-        image_patches = x
-
-        b_I, c_I, np_I, p2_I = image_patches.shape
-
-        image_patches = self.image_proj(image_patches.permute(0, 2, 3, 1))
-        image_patches = image_patches.permute(0, 3, 1, 2)
-
-        text_embed = text_embed.unsqueeze(1)
-        batch = x.shape[0]
-
-        if self.use_affine_level:
-            gamma_E, beta_E = self.MLP(text_embed).view(batch, -1, 1, 1).chunk(2, dim=1)
-
-            b_T, c_T, np_T, p2_T = gamma_E.shape
-            if not self.reuse_registered_text_proj:
-                self.text_proj = nn.Linear(c_T, c_T).to(x.device)
-            gamma_H = self.text_proj(gamma_E.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-            beta_H = self.text_proj(beta_E.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-            b_T, c_T = gamma_H.shape[0], gamma_H.shape[1]
-            # gamma_H = self.exp_map(gamma_H.view(b_T, c_T, -1).permute(0, 2, 1))
-            # beta_H = self.exp_map(beta_H.view(b_T, c_T, -1).permute(0, 2, 1))
-
-
-            gamma_H = self.exp_map(gamma_H)
-            image_patches = self.exp_map(image_patches)
-
-            gamma_H = gamma_H.squeeze(-1).squeeze(-1)
-            image_patches = image_patches.view(b_I, c_I, -1)
-
-            image_patches = self.mobius_translation(image_patches.permute(0, 2, 1), gamma_H, c=self.c)
-            image_patches = image_patches.reshape(b_I, c_I, height, width)
-            image_patches = image_patches.permute(0, 2, 3, 1)  # [2, 96, 96, 48]
-            image_patches = image_patches.reshape(b_I, height * width, c_I)  # [2, 9216, 48]
-
-
-            gamma_H = gamma_H.view(b_T, c_T, -1).permute(0, 2, 1)
-            distance = poincare_loss(image_patches, gamma_H)
-
-            # 2. 恢复原始维度 [2, 9216, 48] -> [2, 48, 96, 96]
-            x = image_patches.reshape(b_image, height, width, c_I)  # [2, 96, 96, 48]
-            x = x.permute(0, 3, 1, 2)  # [2, 48, 96, 96]
-
-            x = self.log_map(x)
-
-
-            gamma_H = gamma_H.permute(0, 2, 1).unsqueeze(3)
-
-
-        return [x, distance]
+    def forward(self, x, anchor, curvature, *, measure_distance=True):
+        batch, channels, height, width = x.shape
+        patches = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+        image = exp_map(self.image_proj(patches).to(dtype=anchor.dtype), curvature)
+        # Embed the shared anchor in each scale's channel subspace with zeros.
+        # Padding both arguments to the widest scale gives the same geometry.
+        anchor = F.pad(anchor, (0, channels - anchor.shape[-1]))
+        translated = mobius_translation(image, anchor, curvature)
+        distance = poincare_loss(translated, anchor, curvature) if measure_distance else None
+        enhanced = log_map(translated, curvature).reshape(batch, height, width, channels)
+        return enhanced.permute(0, 3, 1, 2).to(dtype=x.dtype), distance
 
 
 def print_euclidean_distances(features):
@@ -268,14 +129,6 @@ def print_euclidean_distances(features):
     print("距离矩阵形状:", dist_matrix.shape)
     print("样本0到其他样本的距离:", dist_matrix[0])
 
-
-def safe_project(x, c=1.0):
-    """Project features to Poincaré ball to avoid NaN."""
-    c = torch.clamp_min(c, 1e-8)
-    max_norm = (1 - 1e-5) / torch.sqrt(c)  # Slightly below boundary
-    norm = torch.norm(x, dim=-1, keepdim=True)
-    scale = torch.minimum(max_norm / norm, torch.ones_like(norm))
-    return x * scale
 
 def custom_attention(image_feature, text_feature,patch_size):
 
@@ -345,6 +198,7 @@ class TEDFusion(nn.Module):
                  ffn_expansion_factor=2,
                  bias=False,
                  LayerNorm_type='WithBias',
+                 curvature=1.0,
                  ):
 
         super(TEDFusion, self).__init__()
@@ -362,13 +216,13 @@ class TEDFusion(nn.Module):
         self.attention_spatial = Attention_spatial(dim * 2 ** 3)
 
         self.feature_fusion_4 = Fusion_Embed(embed_dim=dim * 2 ** 3)
-        self.prompt_guidance_4 = FeatureWiseAffine(in_channels=256, out_channels=dim * 2 ** 3,c_I=384)
+        self.prompt_guidance_4 = FeatureWiseAffine(256, dim * 2 ** 3, curvature)
         self.decoder_level4 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2 ** 3), num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor,
                              bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[3])])
 
         self.feature_fusion_3 = Fusion_Embed(embed_dim = dim * 2 ** 2)
-        self.prompt_guidance_3 = FeatureWiseAffine(in_channels=256, out_channels=dim * 2 ** 2,c_I=192)
+        self.prompt_guidance_3 = FeatureWiseAffine(256, dim * 2 ** 2, curvature)
         self.up4_3 = Upsample(int(dim * 2 ** 3))  ## From Level 4 to Level 3
         self.reduce_chan_level3 = nn.Conv2d(int(dim * 2 ** 3), int(dim * 2 ** 2), kernel_size=1, bias=bias)
         self.decoder_level3 = nn.Sequential(*[
@@ -376,7 +230,7 @@ class TEDFusion(nn.Module):
                              bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
 
         self.feature_fusion_2 = Fusion_Embed(embed_dim = dim * 2 ** 1)
-        self.prompt_guidance_2 = FeatureWiseAffine(in_channels=256, out_channels=dim * 2 ** 1,c_I=96)
+        self.prompt_guidance_2 = FeatureWiseAffine(256, dim * 2 ** 1, curvature)
         self.up3_2 = Upsample(int(dim * 2 ** 2))  ## From Level 3 to Level 2
         self.reduce_chan_level2 = nn.Conv2d(int(dim * 2 ** 3), int(dim * 2 ** 1), kernel_size=1, bias=bias)
         self.decoder_level2 = nn.Sequential(*[
@@ -384,7 +238,7 @@ class TEDFusion(nn.Module):
                              bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
 
         self.feature_fusion_1 = Fusion_Embed(embed_dim = dim)
-        self.prompt_guidance_1 = FeatureWiseAffine(in_channels=256, out_channels=dim,c_I=48)
+        self.prompt_guidance_1 = FeatureWiseAffine(256, dim, curvature)
         self.up2_1 = Upsample(int(dim * 2 ** 1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
         self.up2_1_2 = Upsample(int(dim * 2 ** 2))
         self.reduce_chan_level1 = nn.Conv2d(432, int(dim * 2 ** 1), kernel_size=1, bias=bias)
@@ -486,50 +340,24 @@ class TEDFusion(nn.Module):
         h_text = torch.cat([h_text1,h_text2],dim=1)
 
 
-        if self.is_training:
-            # 生成伯努利掩码 [B,1]
-            mask = (torch.rand_like(h_text[:, :1]) < self.drop_prob).float()
-
-            h_text11 = mask * h_attr1 + (1 - mask) * h_text  # [B, text_dim]
-            h_text22 = mask * h_attr2 + (1 - mask) * h_text  # [B, text_dim]
-            h_text33 = mask * h_attr3 + (1 - mask) * h_text  # [B, text_dim]
-            h_text44 = mask * h_attr4 + (1 - mask) * h_text  # [B, text_dim]
+        if self.training and self.is_training:
+            replace_text = torch.rand_like(h_text[:, :1]) < self.drop_prob
         else:
-            # 测试时完全用属性特征替代文本
-            h_text11 = h_attr1
-            h_text22 = h_attr2
-            h_text33 = h_attr3
-            h_text44 = h_attr4
+            replace_text = torch.full_like(h_text[:, :1], not self.is_training, dtype=torch.bool)
 
-        # 动态门控融合
-        gate1 = self.fusion_gate(torch.cat([h_attr1, h_text11], dim=1))  # [B,128]
+        fused_parts = []
+        for attribute in (h_attr1, h_attr2, h_attr3, h_attr4):
+            condition = torch.where(replace_text, attribute, h_text)
+            gate = self.fusion_gate(torch.cat([attribute, condition], dim=1))
+            fused_parts.append(torch.lerp(condition, attribute, gate))
 
-        # 残差融合
-        fused1 = h_attr1 * gate1 + h_text * (1 - gate1)
-
-
-        # 动态门控融合
-        gate2 = self.fusion_gate(torch.cat([h_attr2, h_text22], dim=1))  # [B,128]
-        # 残差融合
-        fused2 = h_attr2 * gate2 + h_text * (1 - gate2)
-
-        # 动态门控融合
-        gate3 = self.fusion_gate(torch.cat([h_attr3, h_text33], dim=1))  # [B,128]
-        # 残差融合
-        fused3 = h_attr3 * gate3 + h_text * (1 - gate3)
-
-        # 动态门控融合
-        gate4 = self.fusion_gate(torch.cat([h_attr4, h_text44], dim=1))  # [B,128]
-        # 残差融合
-        fused4 = h_attr4 * gate4 + h_text * (1 - gate4)
-
-        fused = torch.cat([fused1,fused2,fused3,fused4],dim=1)
-        fusedd = fused1 + fused2 + fused3 + fused4
-
-        self.isss = self.isss + 1
-
-        h_texttt = torch.cat([h_text, h_text,h_text,h_text], dim=1)
-
+        fused = torch.cat(fused_parts, dim=1)
+        fusedd = torch.stack(fused_parts).sum(dim=0)
+        anchor, curvature = shared_text_anchor(fused, (
+            self.prompt_guidance_1, self.prompt_guidance_2,
+            self.prompt_guidance_3, self.prompt_guidance_4,
+        ))
+        self.isss += 1
 
         x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A) #4:[384,12,12] 3:[192,24,24] 2:[96,48,48] 1:[48,96,96]
         x4_B, x3_B, x2_B, x1_B = self.encoder_B(inp_img_B)
@@ -544,19 +372,19 @@ class TEDFusion(nn.Module):
         x4 = self.feature_fusion_4(x4_A, x4_B)
         # x4 = self.attention_spatial(x4)
 
-        x4 = self.prompt_guidance_4(x4, fused)[0]
+        x4, distance4 = self.prompt_guidance_4(x4, anchor, curvature)
         inp4 = x4
         outd4 = self.decoder_level4(inp4)
 
         inp3 = self.up4_3(outd4)
-        inp3 = self.prompt_guidance_3(inp3, fused)[0]
+        inp3, distance3 = self.prompt_guidance_3(inp3, anchor, curvature)
         x3 = self.feature_fusion_3(x3_A, x3_B)
         inp31 = torch.cat([inp3, x3], 1)
         inp31 = self.reduce_chan_level3(inp31)
         outd31 = self.decoder_level3(inp31)
 
         inp2 = self.up3_2(outd31)
-        inp2 = self.prompt_guidance_2(inp2, fused)[0]
+        inp2, distance2 = self.prompt_guidance_2(inp2, anchor, curvature)
         x2 = self.feature_fusion_2(x2_A, x2_B)
         inp21 = torch.cat([x2, self.up3_2(x3)], 1)
         inp22 = torch.cat([inp21,x2,inp2], 1)
@@ -564,7 +392,7 @@ class TEDFusion(nn.Module):
         outd22 = self.decoder_level2(inp22)
 
         inp1 = self.up2_1(outd22)
-        inp1 = self.prompt_guidance_1(inp1, fused)[0]
+        inp1, distance1 = self.prompt_guidance_1(inp1, anchor, curvature)
         x1 = self.feature_fusion_1(x1_A, x1_B)
         inp11 = torch.cat([x1, self.up2_1(x2)], 1)
 
@@ -586,12 +414,7 @@ class TEDFusion(nn.Module):
 
 
 
-        distance1 = self.prompt_guidance_4(x4, h_texttt)[1]
-        distance2 = self.prompt_guidance_3(inp3, h_texttt)[1]
-        distance3 = self.prompt_guidance_2(inp2, h_texttt)[1]
-        distance4 = self.prompt_guidance_1(inp1, h_texttt)[1]
-        distance_all = (distance1 + distance2 + distance3 + distance4)/4.0
-        # distance_all = torch.tensor(0)
+        distance_all = torch.stack((distance1, distance2, distance3, distance4)).mean()
 
         return [outd1,h_text,fusedd,distance_all]
 
@@ -611,6 +434,7 @@ class TEDFusion1(nn.Module):
                  ffn_expansion_factor=2,
                  bias=False,
                  LayerNorm_type='WithBias',
+                 curvature=1.0,
                  ):
 
         super(TEDFusion1, self).__init__()
@@ -628,13 +452,13 @@ class TEDFusion1(nn.Module):
         self.attention_spatial = Attention_spatial(dim * 2 ** 3)
 
         self.feature_fusion_4 = Fusion_Embed(embed_dim=dim * 2 ** 3)
-        self.prompt_guidance_4 = FeatureWiseAffine(in_channels=256, out_channels=dim * 2 ** 3,c_I=384)
+        self.prompt_guidance_4 = FeatureWiseAffine(256, dim * 2 ** 3, curvature)
         self.decoder_level4 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2 ** 3), num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor,
                              bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[3])])
 
         self.feature_fusion_3 = Fusion_Embed(embed_dim = dim * 2 ** 2)
-        self.prompt_guidance_3 = FeatureWiseAffine(in_channels=256, out_channels=dim * 2 ** 2,c_I=192)
+        self.prompt_guidance_3 = FeatureWiseAffine(256, dim * 2 ** 2, curvature)
         self.up4_3 = Upsample(int(dim * 2 ** 3))  ## From Level 4 to Level 3
         self.reduce_chan_level3 = nn.Conv2d(int(dim * 2 ** 3), int(dim * 2 ** 2), kernel_size=1, bias=bias)
         self.decoder_level3 = nn.Sequential(*[
@@ -642,7 +466,7 @@ class TEDFusion1(nn.Module):
                              bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
 
         self.feature_fusion_2 = Fusion_Embed(embed_dim = dim * 2 ** 1)
-        self.prompt_guidance_2 = FeatureWiseAffine(in_channels=256, out_channels=dim * 2 ** 1,c_I=96)
+        self.prompt_guidance_2 = FeatureWiseAffine(256, dim * 2 ** 1, curvature)
         self.up3_2 = Upsample(int(dim * 2 ** 2))  ## From Level 3 to Level 2
         self.reduce_chan_level2 = nn.Conv2d(int(dim * 2 ** 3), int(dim * 2 ** 1), kernel_size=1, bias=bias)
         self.decoder_level2 = nn.Sequential(*[
@@ -650,7 +474,7 @@ class TEDFusion1(nn.Module):
                              bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
 
         self.feature_fusion_1 = Fusion_Embed(embed_dim = dim)
-        self.prompt_guidance_1 = FeatureWiseAffine(in_channels=256, out_channels=dim,c_I=48)
+        self.prompt_guidance_1 = FeatureWiseAffine(256, dim, curvature)
         self.up2_1 = Upsample(int(dim * 2 ** 1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
         self.up2_1_2 = Upsample(int(dim * 2 ** 2))
         self.reduce_chan_level1 = nn.Conv2d(432, int(dim * 2 ** 1), kernel_size=1, bias=bias)
@@ -734,8 +558,8 @@ class TEDFusion1(nn.Module):
         self.all_samples = []
         self.sample_names = []
 
-    def _apply_weak_tiam(self, x, fused, gate_control, guidance_module):
-        guided = guidance_module(x, fused)[0]
+    def _apply_weak_tiam(self, x, anchor, curvature, gate_control, guidance_module):
+        guided, _ = guidance_module(x, anchor, curvature, measure_distance=False)
         strength = self.tiam_strength * (0.5 + gate_control)
         return x + strength * (guided - x)
 
@@ -761,13 +585,11 @@ class TEDFusion1(nn.Module):
             self.fusion_gate(torch.cat([h_attr3, h_attr3], dim=1)),
             self.fusion_gate(torch.cat([h_attr4, h_attr4], dim=1)),
         ]
-        fused_parts = [
-            gate * h_attr + (1.0 - gate) * h_attr
-            for gate, h_attr in zip(
-                gates, [h_attr1, h_attr2, h_attr3, h_attr4]
-            )
-        ]
-        fused = torch.cat(fused_parts, dim=1)
+        fused = torch.cat([h_attr1, h_attr2, h_attr3, h_attr4], dim=1)
+        anchor, curvature = shared_text_anchor(fused, (
+            self.prompt_guidance_1, self.prompt_guidance_2,
+            self.prompt_guidance_3, self.prompt_guidance_4,
+        ))
         gate_control = torch.cat(gates, dim=1).mean(
             dim=1, keepdim=True
         ).view(b, 1, 1, 1)
@@ -782,14 +604,14 @@ class TEDFusion1(nn.Module):
         x4_A, x4_B = self.cross_attention(x4_A, x4_B)
         x4 = self.feature_fusion_4(x4_A, x4_B)
         x4 = self._apply_weak_tiam(
-            x4, fused, gate_control, self.prompt_guidance_4
+            x4, anchor, curvature, gate_control, self.prompt_guidance_4
         )
         inp4 = x4
         outd4 = self.decoder_level4(inp4)
 
         inp3 = self.up4_3(outd4)
         inp3 = self._apply_weak_tiam(
-            inp3, fused, gate_control, self.prompt_guidance_3
+            inp3, anchor, curvature, gate_control, self.prompt_guidance_3
         )
         x3 = self.feature_fusion_3(x3_A, x3_B)
         inp31 = torch.cat([inp3, x3], 1)
@@ -798,7 +620,7 @@ class TEDFusion1(nn.Module):
 
         inp2 = self.up3_2(outd31)
         inp2 = self._apply_weak_tiam(
-            inp2, fused, gate_control, self.prompt_guidance_2
+            inp2, anchor, curvature, gate_control, self.prompt_guidance_2
         )
         x2 = self.feature_fusion_2(x2_A, x2_B)
         inp21 = torch.cat([x2, self.up3_2(x3)], 1)
@@ -808,7 +630,7 @@ class TEDFusion1(nn.Module):
 
         inp1 = self.up2_1(outd22)
         inp1 = self._apply_weak_tiam(
-            inp1, fused, gate_control, self.prompt_guidance_1
+            inp1, anchor, curvature, gate_control, self.prompt_guidance_1
         )
         x1 = self.feature_fusion_1(x1_A, x1_B)
         inp11 = torch.cat([x1, self.up2_1(x2)], 1)

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import numpy as np
 from PIL import Image
 from skimage.feature import graycomatrix, graycoprops
@@ -8,6 +9,7 @@ import torch
 from torchvision.transforms import functional as F
 
 from model.TEDFusion_model import TEDFusion1 as create_model1
+from scripts.image_output import existing_image_names, reserve_image_stem, write_image
 
 
 import argparse
@@ -32,8 +34,7 @@ def main(args):
 
     root_path = args.dataset_path
     save_path = args.save_path
-    if os.path.exists(save_path) is False:
-        os.makedirs(save_path)
+    os.makedirs(save_path, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     supported = [".jpg", ".JPG", ".png", ".PNG", ".bmp", 'tif', 'TIF']
@@ -52,21 +53,30 @@ def main(args):
 
     print("Find the number of visible image: {},  the number of the infrared image: {}".format(len(visible_path), len(infrared_path)))
     assert len(visible_path) == len(infrared_path), "The number of the source images does not match!"
+    output_names = _output_names(visible_path, save_path)
 
     print("Begin to run!")
     with torch.no_grad():
-        model_clip, _ = clip.load("ViT-B/32", device=device)
-        model = create_model1(model_clip).to(device)
+        checkpoint = torch.load(args.weights_path, map_location="cpu", weights_only=False)
+        curvature = getattr(args, "curvature", None)
+        if curvature is None:
+            curvature = checkpoint.get("curvature", 1.0)
+        model_weights = checkpoint["model"]
+        model_weights.pop("conv48to384.weight", None)
+        model_weights.pop("conv48to384.bias", None)
+        del checkpoint
 
-        model_weight_path = args.weights_path
-        model.load_state_dict(torch.load(model_weight_path, map_location=device)['model'])
+        model_clip, _ = clip.load("ViT-B/32", device=device)
+        model = create_model1(model_clip, curvature=curvature).to(device)
+        model.load_state_dict(model_weights)
+        del model_weights
         model.eval()
 
     for i in range(len(visible_path)):
         ir_path = infrared_path[i]
         vi_path = visible_path[i]
 
-        img_name = vi_path.replace("\\", "/").split("/")[-1]
+        img_name = output_names[vi_path]
 
         assert os.path.exists(ir_path), "file: '{}' dose not exist.".format(ir_path)
         assert os.path.exists(vi_path), "file: '{}' dose not exist.".format(vi_path)
@@ -159,14 +169,35 @@ def mergy_Y_RGB_to_YCbCr(img1, img2):
     merged_img = cv2.cvtColor(merged_img_YCbCr, cv2.COLOR_YCrCb2RGB)
     return merged_img
 
-def save_pic(outputpic, path, index : str):
+def _output_names(visible_paths, save_path):
+    used_names = existing_image_names(save_path)
+    names = {}
+    collisions = []
+    # Reserve preferred names before allocating aliases. A native PNG takes priority.
+    for path in sorted(visible_paths, key=lambda name: Path(name).suffix == ".jpg"):
+        source = Path(path)
+        suffix = ".png" if source.suffix == ".jpg" else source.suffix
+        preferred_name = source.stem + suffix
+        key = preferred_name.casefold()
+        if key in used_names:
+            collisions.append((path, source.stem, suffix))
+        else:
+            names[path] = preferred_name
+            used_names.add(key)
+
+    for path, stem, suffix in collisions:
+        stem = reserve_image_stem(stem, (suffix,), used_names)
+        names[path] = stem + suffix
+    return names
+
+
+def save_pic(outputpic, path, index: str):
     outputpic[outputpic > 1.] = 1
     outputpic[outputpic < 0.] = 0
     outputpic = cv2.UMat(outputpic).get()
     outputpic = cv2.normalize(outputpic, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_32F)
-    outputpic=outputpic[:, :, ::-1]
-    save_path = os.path.join(path, index).replace(".jpg", ".png")
-    cv2.imwrite(save_path, outputpic)
+    outputpic = outputpic[:, :, ::-1]
+    write_image(os.path.join(path, index), outputpic)
 
 
 def _check_rgb_batch(images):
@@ -232,7 +263,8 @@ def _texture_complexity(images, weights):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_path', type=str, required=True, help='test data root path')
-    parser.add_argument('--weights_path', type=str, required=True, help='initial weights path')
+    parser.add_argument('--weights_path', type=str, required=True, help='trusted local model checkpoint')
+    parser.add_argument('--curvature', type=float, default=None, help='override the checkpoint curvature')
     parser.add_argument('--save_path', type=str, default='./results', help='output save image path')
     # parser.add_argument('--input_text', type=str, required=True, help='text control input')
 

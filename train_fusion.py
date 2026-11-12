@@ -10,6 +10,7 @@ from data.prompt_dataset import PromptDataSet
 from data.simple_dataset import SimpleDataSet
  
 from model.TEDFusion_model import TEDFusion as create_model
+from model.TEDFusion_model import validate_curvature
 from scripts.utils import read_data, train_one_epoch, evaluate, create_lr_scheduler
 import datetime
 import warnings
@@ -94,6 +95,24 @@ def initialize_pixelshuffle_phases(model):
     return initialized_parameters
 
 def main(args):
+    checkpoint = None
+    checkpoint_args = None
+    initial_weights = None
+    curvature = getattr(args, "curvature", None)
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        checkpoint_args = checkpoint.get("args")
+        saved_curvature = checkpoint.get("curvature", 1.0)
+        if curvature is not None and curvature != saved_curvature:
+            raise ValueError("--resume requires the checkpoint curvature. Use --weights for a new curvature experiment.")
+        curvature = saved_curvature
+    elif args.weights:
+        initial_weights = torch.load(args.weights, map_location="cpu", weights_only=False)
+        if curvature is None:
+            curvature = initial_weights.get("curvature", 1.0)
+    args.curvature = validate_curvature(1.0 if curvature is None else curvature)
+    print("TIAM curvature: {}".format(args.curvature))
+
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     set_seed(TRAIN_SEED)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -216,24 +235,16 @@ def main(args):
                                              generator=val_generator)
 
     model_clip, _ = clip.load("ViT-B/32", device=device)
-    # model = create_model(model_clip, curvature=1.5).to(device)
-    model = create_model(model_clip).to(device)
+    model = create_model(model_clip, curvature=args.curvature).to(device)
 
     for param in model.model_clip.parameters():
         param.requires_grad = False
 
-    checkpoint = None
-    checkpoint_args = None
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
-        checkpoint_args = checkpoint.get("args")
-
     if checkpoint is not None:
         model.load_state_dict(checkpoint['model'])
-    elif args.weights != "":
-        assert os.path.exists(args.weights), "weights file: '{}' not exist.".format(args.weights)
-        weights_dict = torch.load(args.weights, map_location=device)["model"]
-        print(model.load_state_dict(weights_dict, strict=False))
+    elif initial_weights is not None:
+        print(model.load_state_dict(initial_weights["model"], strict=False))
+        del initial_weights
     else:
         initialized_parameters = initialize_pixelshuffle_phases(model)
         print("Checkerboard guard: phase-aligned {:,} PixelShuffle parameters.".format(
@@ -253,7 +264,8 @@ def main(args):
     if args.use_dp == True:
         model = torch.nn.DataParallel(model).cuda()
 
-    pg = [p for p in model.parameters() if p.requires_grad]
+    # Fixed log_c entries retain their positions in legacy optimizer checkpoints.
+    pg = [p for name, p in model.named_parameters() if p.requires_grad or name.endswith(".log_c")]
     learning_rate = args.lr
     if learning_rate is None:
         learning_rate = 2e-5 if is_finetuning else 1e-4
@@ -324,6 +336,7 @@ def main(args):
                 "lr_scheduler": lr_scheduler.state_dict(),
                 "epoch": epoch,
                 "args": args,
+                "curvature": args.curvature,
                 "seed": TRAIN_SEED,
                 "best_val_loss": best_val_loss,
                 "rng_state": get_rng_state(train_generator, val_generator),
@@ -353,6 +366,8 @@ if __name__ == '__main__':
                         help='random training pairs drawn per epoch; 800 matches the original small-MSRS run')
     parser.add_argument('--max_val_samples', type=int, default=80,
                         help='maximum number of deterministic validation pairs')
+    parser.add_argument('--curvature', type=float, default=None,
+                        help='fixed TIAM curvature (defaults to the checkpoint value or 1.0)')
 
     parser.add_argument('--dataset_path', type=str, default=None,
                         help='set one dataset root for all four task slots')
@@ -362,11 +377,11 @@ if __name__ == '__main__':
     parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS")
 
     parser.add_argument('--weights', type=str, default='',
-                        help='initial weights path')
+                        help='trusted local checkpoint for initial weights')
     parser.add_argument('--train_upsamplers', action='store_true',
                         help='also update PixelShuffle convolutions when fine-tuning (not recommended for MSRS)')
     parser.add_argument('--val_every_epcho', type=int, default=2, help='val every epcho')
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume', default='', help='resume from a trusted local checkpoint')
     parser.add_argument('--use_dp', default = False, help='use dp-multigpus')
     parser.add_argument('--device', default='cuda', help='device (i.e. cuda or cpu)')
     parser.add_argument('--gpu_id', default='0', help='device id (i.e. 0, 1, 2 or 3)')
