@@ -1,4 +1,5 @@
 import os
+import math
 import sys
 import random
 import clip
@@ -134,8 +135,58 @@ def balance_pixelshuffle_dc(model):
         phase_weight.add_((target_dc - phase_dc) / kernel_area)
 
 
+def _json_number(value):
+    return value if math.isfinite(value) else str(value)
+
+
+def _report_hyperbolic_batch(write_record, phase, epoch, step, names,
+                            distance, loss, accumulated_loss, scales):
+    distances = distance.detach().reshape(-1).cpu().tolist()
+    batch_loss = loss.detach().mean().item()
+    running_loss = (accumulated_loss + loss.detach()).mean().item() / (step + 1)
+    displayed_loss = f'{running_loss:.3f}'
+    findings = []
+
+    if math.isfinite(running_loss) and running_loss != 0 and float(displayed_loss) == 0:
+        findings.append('display_precision')
+    if not math.isfinite(batch_loss):
+        findings.append('nonfinite_batch_loss')
+    has_fallback = any(scale['nonfinite_loss_before_fallback'] is not None for scale in scales)
+    if has_fallback:
+        findings.append('nonfinite_scale_fallback')
+
+    if batch_loss == 0:
+        zero_evidence = []
+        if any(math.isfinite(value) and value > 0 for value in distances):
+            zero_evidence.append('loss_scaling_underflow')
+        if any(scale['acosh_rounded_to_one_count'] for scale in scales):
+            zero_evidence.append('acosh_rounded_to_one')
+        if any(scale['zero_increment_with_positive_delta_count'] for scale in scales):
+            zero_evidence.append('distance_increment_underflow')
+        if scales and all(scale['pair_count'] == scale['zero_delta_count'] for scale in scales):
+            zero_evidence.append('all_euclidean_deltas_zero')
+        findings.append('zero_batch_loss')
+        findings.extend(zero_evidence)
+        if not has_fallback and not zero_evidence:
+            findings.append('unexplained_zero')
+
+    write_record({
+        'event': 'batch',
+        'phase': phase,
+        'epoch': epoch,
+        'step': step,
+        'samples': list(names),
+        'distance_all': [_json_number(value) for value in distances],
+        'batch_hyperbolic_loss': _json_number(batch_loss),
+        'running_hyperbolic_loss': _json_number(running_loss),
+        'displayed_hyperbolic_loss': displayed_loss,
+        'findings': findings,
+        'scales': sorted(scales, key=lambda scale: (scale['device'], -scale['level'])),
+    })
+
+
 def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, device, epoch,
-                    grad_clip_norm=1.0):
+                    grad_clip_norm=1.0, hyperbolic_debug=None):
     processor, model_text = load_local_blip()
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -228,10 +279,17 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
 
         # text = torch.cat([text1,text2],dim=1)
 
-        I_fused,htext,hattr,distance_all = model(I_A, I_B, text1,text2, feature)
+        scale_diagnostics = [] if hyperbolic_debug is not None else None
+        debug_kwargs = {'hyperbolic_report': scale_diagnostics.append} if scale_diagnostics is not None else {}
+        I_fused,htext,hattr,distance_all = model(I_A, I_B, text1,text2, feature, **debug_kwargs)
 
 
         loss, loss_ssim, loss_max, loss_color, loss_text, loss_semantic,loss_hyperbolic = loss_function_prompt(I_A_gt, I_B_gt, I_fused,htext,hattr,distance_all, task)
+
+        if hyperbolic_debug is not None:
+            _report_hyperbolic_batch(hyperbolic_debug, 'train', epoch, step, name,
+                                     distance_all, loss_hyperbolic, accu_hyperbolic_loss,
+                                     scale_diagnostics)
 
         loss.backward()
 
@@ -270,7 +328,7 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, epoch, lr, filefold_path):
+def evaluate(model, data_loader, device, epoch, lr, filefold_path, hyperbolic_debug=None):
     processor, model_text = load_local_blip()
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model_text = model_text.to(device)
@@ -366,7 +424,9 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
 
 
 
-        I_fused,htext,hattr,distance_all = model(I_A, I_B, text1,text2, feature)
+        scale_diagnostics = [] if hyperbolic_debug is not None else None
+        debug_kwargs = {'hyperbolic_report': scale_diagnostics.append} if scale_diagnostics is not None else {}
+        I_fused,htext,hattr,distance_all = model(I_A, I_B, text1,text2, feature, **debug_kwargs)
 
         if epoch % save_epoch == 0:
             if cnt <= save_length:
@@ -381,6 +441,10 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
                 cnt += 1
 
         loss, loss_ssim, loss_max, loss_color, loss_text, loss_semantic,loss_hyperbolic = loss_function_prompt(I_A_gt, I_B_gt, I_fused,htext,hattr,distance_all, task)
+        if hyperbolic_debug is not None:
+            _report_hyperbolic_batch(hyperbolic_debug, 'val', epoch, step, name,
+                                     distance_all, loss_hyperbolic, accu_hyperbolic_loss,
+                                     scale_diagnostics)
 
         accu_total_loss += loss
         accu_ssim_loss += loss_ssim.detach()

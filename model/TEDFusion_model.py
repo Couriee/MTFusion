@@ -13,7 +13,11 @@ def hyperbolic_projection(x):
 
 
 
-def poincare_distance(u, v):
+def _nonfinite_count(tensor):
+    return torch.count_nonzero(~torch.isfinite(tensor.detach())).item()
+
+
+def poincare_distance(u, v, diagnostics=None):
     c = torch.tensor(1.0).to(args.device)
     eps = torch.tensor(1e-5).to(args.device)
     """计算庞加莱球中的双曲距离"""
@@ -26,9 +30,22 @@ def poincare_distance(u, v):
 
     # 双曲距离公式
     denominator = (1 - c * u_norm ** 2) * (1 - c * v_norm ** 2)
-    return (2 / torch.sqrt(c)) * torch.acosh(
-        1 + 2 * c * delta ** 2 / denominator.clamp_min(eps)
-    )
+    increment = 2 * c * delta ** 2 / denominator.clamp_min(eps)
+    acosh_input = 1 + increment
+    if diagnostics is not None:
+        with torch.no_grad():
+            diagnostics.update(
+                pair_count=delta.numel(),
+                zero_delta_count=torch.count_nonzero(delta == 0).item(),
+                acosh_rounded_to_one_count=torch.count_nonzero(
+                    (increment > 0) & (acosh_input == 1)
+                ).item(),
+                zero_increment_with_positive_delta_count=torch.count_nonzero(
+                    (delta > 0) & (increment == 0)
+                ).item(),
+                nonfinite_acosh_input_count=_nonfinite_count(acosh_input),
+            )
+    return (2 / torch.sqrt(c)) * torch.acosh(acosh_input)
 
 
 def hyperbolic_norm(x):
@@ -47,7 +64,7 @@ def safe_project(x, c=1.0):
     return x * scale
 
 
-def poincare_loss(img_feats, txt_feats):
+def poincare_loss(img_feats, txt_feats, diagnostics=None):
     # 调整tau值避免权重极端化
     tau = torch.tensor(0.5).to(img_feats.device)  # 从0.1增加到0.5，避免权重极端
 
@@ -59,18 +76,38 @@ def poincare_loss(img_feats, txt_feats):
     c = torch.tensor(1.0, device=img_feats.device, dtype=img_feats.dtype)
     c = torch.clamp_min(c, 1e-4)  # 增加最小值避免数值问题
 
+    if diagnostics is not None:
+        diagnostics.update(
+            dtype=str(img_feats.dtype),
+            nonfinite_image_feature_count=_nonfinite_count(img_feats),
+            nonfinite_text_feature_count=_nonfinite_count(txt_feats),
+            nonfinite_loss_before_fallback=None,
+        )
+
     # 投影到有效范围
     img_feats = safe_project(img_feats, c)
     txt_feats = safe_project(txt_feats, c)
+    if diagnostics is not None:
+        diagnostics.update(
+            nonfinite_projected_image_count=_nonfinite_count(img_feats),
+            nonfinite_projected_text_count=_nonfinite_count(txt_feats),
+        )
 
     # 1. 计算双曲范数差
     img_norms = hyperbolic_norm(img_feats)  # [B,N]
     txt_norms = hyperbolic_norm(txt_feats)  # [B,1]
+    if diagnostics is not None:
+        diagnostics.update(
+            nonfinite_image_norm_count=_nonfinite_count(img_norms),
+            nonfinite_text_norm_count=_nonfinite_count(txt_norms),
+        )
     norm_diff = torch.abs(img_norms - txt_norms)  # [B,N]
 
     # 2. 计算自适应权重（添加数值稳定性）
     norm_diff = torch.clamp(norm_diff, min=1e-8, max=5.0)  # 限制范围避免极端值
     weights = torch.exp(-norm_diff / tau)  # [B,N]
+    if diagnostics is not None:
+        diagnostics['nonfinite_weight_count'] = _nonfinite_count(weights)
 
     # 检查权重是否正常
     if torch.any(weights.isnan()) or torch.any(weights.isinf()):
@@ -80,13 +117,15 @@ def poincare_loss(img_feats, txt_feats):
     # 3. 计算双曲距离
     # 扩展文本特征以匹配图像特征维度
     txt_feats_expanded = txt_feats.expand_as(img_feats)
-    distances = poincare_distance(img_feats, txt_feats_expanded)  # [B,N,1] 或 [B,N]
+    distances = poincare_distance(img_feats, txt_feats_expanded, diagnostics)  # [B,N,1] 或 [B,N]
 
     # 如果距离是3D，压缩最后一维
     if distances.dim() == 3 and distances.shape[-1] == 1:
         distances = distances.squeeze(-1)  # [B,N]
 
     # 检查距离是否正常
+    if diagnostics is not None:
+        diagnostics['nonfinite_distance_count'] = _nonfinite_count(distances)
     if torch.any(distances.isnan()) or torch.any(distances.isinf()):
         print(f"Warning: Invalid distances detected. min:{distances.min():.6f}, max:{distances.max():.6f}")
         distances = torch.clamp(distances, min=0.0, max=10.0)
@@ -101,6 +140,8 @@ def poincare_loss(img_feats, txt_feats):
 
     # 调试输出（训练初期可开启）
     if torch.isnan(loss) or torch.isinf(loss):
+        if diagnostics is not None:
+            diagnostics['nonfinite_loss_before_fallback'] = str(loss.detach().item())
         print(f"DEBUG - loss:{loss:.6f}, weights mean:{weights.mean():.6f}, "
               f"distances mean:{distances.mean():.6f}, "
               f"norm_diff mean:{norm_diff.mean():.6f}")
@@ -209,7 +250,7 @@ class FeatureWiseAffine(nn.Module):
         # 归一化处理
         return scale * y
 
-    def forward(self, x, text_embed):
+    def forward(self, x, text_embed, diagnostics=None):
         b_image, c_image, height, width = x.shape
         image_patches = x
 
@@ -247,7 +288,7 @@ class FeatureWiseAffine(nn.Module):
 
 
             gamma_H = gamma_H.view(b_T, c_T, -1).permute(0, 2, 1)
-            distance = poincare_loss(image_patches, gamma_H)
+            distance = poincare_loss(image_patches, gamma_H, diagnostics)
 
             # 2. 恢复原始维度 [2, 9216, 48] -> [2, 48, 96, 96]
             x = image_patches.reshape(b_image, height, width, c_I)  # [2, 96, 96, 48]
@@ -450,7 +491,18 @@ class TEDFusion(nn.Module):
         # self.drop_prob = 1
         # self.dummy_text = nn.Parameter(torch.randn(1, 64))
 
-    def forward(self, inp_img_A, inp_img_B, text1,text2,feature):
+    @staticmethod
+    def _guidance_distance(guidance, image_features, text_features, level, report):
+        if report is None:
+            return guidance(image_features, text_features)[1]
+
+        diagnostics = {'level': level, 'device': str(image_features.device)}
+        distance = guidance(image_features, text_features, diagnostics=diagnostics)[1]
+        diagnostics['returned_distance'] = distance.detach().item()
+        report(diagnostics)
+        return distance
+
+    def forward(self, inp_img_A, inp_img_B, text1,text2,feature, hyperbolic_report=None):
         b = inp_img_A.shape[0]
         # text1 = text1.float()
         # text2 = text2.float()
@@ -586,10 +638,10 @@ class TEDFusion(nn.Module):
 
 
 
-        distance1 = self.prompt_guidance_4(x4, h_texttt)[1]
-        distance2 = self.prompt_guidance_3(inp3, h_texttt)[1]
-        distance3 = self.prompt_guidance_2(inp2, h_texttt)[1]
-        distance4 = self.prompt_guidance_1(inp1, h_texttt)[1]
+        distance1 = self._guidance_distance(self.prompt_guidance_4, x4, h_texttt, 4, hyperbolic_report)
+        distance2 = self._guidance_distance(self.prompt_guidance_3, inp3, h_texttt, 3, hyperbolic_report)
+        distance3 = self._guidance_distance(self.prompt_guidance_2, inp2, h_texttt, 2, hyperbolic_report)
+        distance4 = self._guidance_distance(self.prompt_guidance_1, inp1, h_texttt, 1, hyperbolic_report)
         distance_all = (distance1 + distance2 + distance3 + distance4)/4.0
         # distance_all = torch.tensor(0)
 

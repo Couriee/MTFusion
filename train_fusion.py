@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 
 import torch
 import torch.optim as optim
@@ -119,6 +120,29 @@ def main(args):
     os.makedirs(file_log_path)
 
     tb_writer = SummaryWriter(log_dir=file_log_path)
+
+    hyperbolic_debug = None
+    debug_log_path = getattr(args, 'hyperbolic_debug_log', '')
+    if debug_log_path:
+        debug_to_stdout = debug_log_path == '-'
+        if not debug_to_stdout:
+            debug_log_path = os.path.abspath(os.path.expanduser(debug_log_path))
+            os.makedirs(os.path.dirname(debug_log_path), exist_ok=True)
+
+        def hyperbolic_debug(record):
+            row = {'run_id': file_name, **record}
+            line = json.dumps(row, ensure_ascii=False, allow_nan=False)
+            if debug_to_stdout:
+                # Start a fresh line after a progress bar's carriage return.
+                print('\nHYPERBOLIC_JSON ' + line, flush=True)
+            else:
+                with open(debug_log_path, 'a', encoding='utf-8') as stream:
+                    stream.write(line + '\n')
+
+        hyperbolic_debug({'event': 'run', 'gpu_id': args.gpu_id, 'batch_size': args.batch_size,
+                          'epochs': args.epochs, 'samples_per_epoch': args.samples_per_epoch})
+        destination = 'standard output' if debug_to_stdout else debug_log_path
+        print('Hyperbolic diagnostics written to {}'.format(destination), flush=True)
 
     best_val_loss = 1e5
     start_epoch = 0
@@ -289,7 +313,8 @@ def main(args):
                                                 lr_scheduler=lr_scheduler,
                                                 device=device,
                                                 epoch=epoch,
-                                                grad_clip_norm=args.grad_clip_norm)
+                                                grad_clip_norm=args.grad_clip_norm,
+                                                hyperbolic_debug=hyperbolic_debug)
 
         tb_writer.add_scalar("train_total_loss", train_loss, epoch)
         tb_writer.add_scalar("train_ssim_loss", train_ssim_loss, epoch)
@@ -303,7 +328,8 @@ def main(args):
             val_loss, val_ssim_loss, val_max_loss, val_color_loss, val_text_loss, val_semantic_loss, val_hyperbolic_loss = evaluate(model=model,
                                          data_loader=val_loader,
                                          device=device,
-                                         epoch=epoch, lr=lr, filefold_path=file_img_path)
+                                         epoch=epoch, lr=lr, filefold_path=file_img_path,
+                                         hyperbolic_debug=hyperbolic_debug)
 
             tb_writer.add_scalar("val_total_loss", val_loss, epoch)
             tb_writer.add_scalar("val_ssim_loss", val_ssim_loss, epoch)
@@ -353,6 +379,8 @@ if __name__ == '__main__':
                         help='random training pairs drawn per epoch; 800 matches the original small-MSRS run')
     parser.add_argument('--max_val_samples', type=int, default=80,
                         help='maximum number of deterministic validation pairs')
+    parser.add_argument('--hyperbolic_debug_log', type=str, default='',
+                        help="append hyperbolic diagnostics to a JSON Lines file, or use '-' for standard output")
 
     parser.add_argument('--dataset_path', type=str, default=None,
                         help='set one dataset root for all four task slots')

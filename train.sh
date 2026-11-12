@@ -1,1 +1,2 @@
-python train_fusion.py   --dataset_path "./dataset/MSRS_split"   --samples_per_epoch 800   --epochs 25   --lr 1e-4   --weight_decay 1e-4   --grad_clip_norm 1.0
+# python train_fusion.py   --dataset_path "./dataset/MSRS_split"   --samples_per_epoch 800   --epochs 25   --lr 1e-4   --weight_decay 1e-4   --grad_clip_norm 1.0
+set -o pipefail && python -u train_fusion.py --dataset_path "./dataset/MSRS_split" --samples_per_epoch 800 --epochs 25 --lr 1e-4 --weight_decay 1e-4 --grad_clip_norm 1.0 --hyperbolic_debug_log - 2>&1 | tee -a "./hyperbolic.log"
