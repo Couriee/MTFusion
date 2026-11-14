@@ -13,7 +13,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 import torch
-from skimage.feature import graycomatrix, graycoprops
+from skimage.feature import graycomatrix
 
 from args_fusion import args
 from model.TEDFusion_model import TEDFusion, TEDFusion1
@@ -29,7 +29,7 @@ def _load_attribute_tools(relative_path):
     }
     namespace = {
         'np': np, 'torch': torch, 'cv2': cv2,
-        'graycomatrix': graycomatrix, 'graycoprops': graycoprops,
+        'graycomatrix': graycomatrix,
     }
     helpers = ast.Module(body=[
         node for node in tree.body
@@ -133,6 +133,17 @@ class AttributeBatchTests(unittest.TestCase):
     def test_unpaired_shapes_are_rejected(self):
         with self.assertRaisesRegex(ValueError, 'Paired image shapes'):
             extract_pair_attributes(torch.rand(2, 3, 8, 8), torch.rand(1, 3, 8, 8))
+
+    def test_texture_matches_appendix_a_for_alternating_rows(self):
+        rows = (torch.arange(32) % 2) * (4.0 / 255)
+        image = rows.view(1, 1, 32, 1).expand(1, 3, 32, 32)
+        # Each matrix has two equally probable entries, so E = 0.5.
+        # Six diagonal offsets cross rows of opposite gray levels, so
+        # H = (10 * 1 + 6 * (1 / (1 + 4))) / 16 = 0.7.
+        expected = torch.tensor([[0.58, 0.56]])  # Visible, infrared
+        for name, extractor in STAGE_EXTRACTORS.items():
+            with self.subTest(stage=name):
+                torch.testing.assert_close(extractor(image, image)[:, [2, 6]], expected)
 
     def test_independent_stage_sections_produce_the_same_repaired_attributes(self):
         a, b = torch.rand(4, 3, 8, 16), torch.rand(4, 3, 8, 16)

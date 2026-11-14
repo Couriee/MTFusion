@@ -11,7 +11,7 @@ import numpy as np
 import cv2
 import colorsys
 
-from skimage.feature import graycomatrix, graycoprops
+from skimage.feature import graycomatrix
 from skimage import io
 
 from scripts.image_output import existing_image_names, reserve_image_stem, write_image
@@ -196,13 +196,13 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         h1, s1, v1 = mergy_RGB_to_HSV(I_A)
         s_avg1 = s1.mean(axis=(1, 2))
         v_avg1 = v1.mean(axis=(1, 2))
-        texture_complexity1 = _texture_complexity(I_A, (0.7, 0.3))
+        texture_complexity1 = _texture_complexity(I_A, (0.6, 0.4))
         contrast1 = calculate_contrast(I_A.detach()).cpu().numpy()
 
         h2, s2, v2 = mergy_RGB_to_HSV(I_B)
         s_avg2 = s2.mean(axis=(1, 2))
         v_avg2 = v2.mean(axis=(1, 2))
-        texture_complexity2 = _texture_complexity(I_B, (0.6, 0.4))
+        texture_complexity2 = _texture_complexity(I_B, (0.7, 0.3))
         contrast2 = calculate_contrast(I_B.detach()).cpu().numpy()
 
         feature = torch.as_tensor(
@@ -339,13 +339,13 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
         h1, s1, v1 = mergy_RGB_to_HSV(I_A)
         s_avg1 = s1.mean(axis=(1, 2))
         v_avg1 = v1.mean(axis=(1, 2))
-        texture_complexity1 = _texture_complexity(I_A, (0.7, 0.3))
+        texture_complexity1 = _texture_complexity(I_A, (0.6, 0.4))
         contrast1 = calculate_contrast(I_A.detach()).cpu().numpy()
 
         h2, s2, v2 = mergy_RGB_to_HSV(I_B)
         s_avg2 = s2.mean(axis=(1, 2))
         v_avg2 = v2.mean(axis=(1, 2))
-        texture_complexity2 = _texture_complexity(I_B, (0.6, 0.4))
+        texture_complexity2 = _texture_complexity(I_B, (0.7, 0.3))
         contrast2 = calculate_contrast(I_B.detach()).cpu().numpy()
 
         feature = torch.as_tensor(
@@ -517,19 +517,19 @@ def calculate_edge(tensor):
 
 
 def _texture_complexity(images, weights):
-    """Apply the existing single-image GLCM calculation independently."""
+    """Compute per-image texture complexity using Appendix A, Eqs. (10)-(13)."""
+    levels = np.arange(256)
+    homogeneity_weights = 1.0 / (1 + np.abs(levels[:, None] - levels[None, :]))
     values = []
-    for image in images.detach():
-        # Preserve the original B=1 spatial reduction and quantization. Only
-        # remove aggregation across different batch samples in this repair.
-        gray = rgb_to_gray(image.unsqueeze(0)).sum(dim=0).sum(dim=1)
-        gray = (gray.cpu().numpy() * 255).astype(np.uint8)
+    for gray in rgb_to_gray(images.detach())[:, 0].cpu().numpy():
+        # Keep both spatial dimensions for the four GLCM directions.
+        gray = np.rint(np.clip(gray, 0.0, 1.0) * 255).astype(np.uint8)
         glcm = graycomatrix(
             gray, [2, 4, 8, 16], [0, np.pi / 4, np.pi / 2, np.pi * 3 / 4],
             256, symmetric=True, normed=True,
-        ).astype(np.float32)
-        energy = graycoprops(glcm, 'energy').mean()
-        homogeneity = graycoprops(glcm, 'homogeneity').mean()
+        )
+        energy = np.square(glcm).sum(axis=(0, 1)).mean()
+        homogeneity = np.einsum('ijda,ij->da', glcm, homogeneity_weights).mean()
         values.append(weights[0] * energy + weights[1] * homogeneity)
     return np.asarray(values, dtype=np.float32)
 
