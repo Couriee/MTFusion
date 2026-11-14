@@ -262,7 +262,7 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
             sys.exit(1)
 
         optimizer.step()
-        balance_pixelshuffle_dc(model)
+        # balance_pixelshuffle_dc(model)  # 去除PixelShuffle 相位平衡
         lr_scheduler.step()
         optimizer.zero_grad()
 
