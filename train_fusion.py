@@ -234,7 +234,9 @@ def main(args):
                                              worker_init_fn=seed_worker,
                                              generator=val_generator)
 
+    # model_clip, _ = clip.load("ViT-B/32", device=device)
     model_clip, _ = clip.load("ViT-B/32", device=device, download_root=os.path.dirname(os.path.realpath(__file__)))
+
     model = create_model(model_clip, curvature=args.curvature).to(device)
 
     for param in model.model_clip.parameters():

@@ -4,33 +4,7 @@ from metric.Qabf import get_Qabf
 from metric.Nabf import get_Nabf
 import math
 from metric.ssim import ssim, ms_ssim
-
-
-def EN_function(image_array):
-    # 计算图像的直方图
-    histogram, bins = np.histogram(image_array, bins=256, range=(0, 255))
-    # 将直方图归一化
-    histogram = histogram / float(np.sum(histogram))
-    # 计算熵
-    entropy = -np.sum(histogram * np.log2(histogram + 1e-7))
-    return entropy
-
-
-def SF_function(image):
-    image_array = np.array(image)
-    RF = np.diff(image_array, axis=0)
-    RF1 = np.sqrt(np.mean(np.mean(RF ** 2)))
-    CF = np.diff(image_array, axis=1)
-    CF1 = np.sqrt(np.mean(np.mean(CF ** 2)))
-    SF = np.sqrt(RF1 ** 2 + CF1 ** 2)
-    return SF
-
-
-def SD_function(image_array):
-    m, n = image_array.shape
-    u = np.mean(image_array)
-    SD = np.sqrt(np.sum(np.sum((image_array - u) ** 2)) / (m * n))
-    return SD
+from metric.fusion_metrics import AG_function, EN_function, SCD_function, SD_function, SF_function, corr2
 
 
 def PSNR_function(A, B, F):
@@ -129,18 +103,6 @@ def CC_function(A, B, F):
     return CC
 
 
-def corr2(a, b):
-    a = a - np.mean(a)
-    b = b - np.mean(b)
-    r = np.sum(a * b) / np.sqrt(np.sum(a * a) * np.sum(b * b))
-    return r
-
-
-def SCD_function(A, B, F):
-    r = corr2(F - B, A) + corr2(F - A, B)
-    return r
-
-
 def Qabf_function(A, B, F):
     return get_Qabf(A, B, F)
 
@@ -190,18 +152,6 @@ def MI_function2(A, B, C, F, gray_level=256):
     MIC = Hab(C, F, gray_level)
     MI_results = MIA + MIB + MIC
     return MI_results
-
-
-def AG_function(image):
-    width = image.shape[0]
-    width = width - 1
-    height = image.shape[1]
-    height = height - 1
-    tmp = 0.0
-    [grady, gradx] = np.gradient(image)
-    s = np.sqrt((np.square(gradx) + np.square(grady)) / 2)
-    AG = np.sum(np.sum(s)) / (width * height)
-    return AG
 
 
 def SSIM_function(A, B, F):

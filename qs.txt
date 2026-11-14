@@ -1,0 +1,26 @@
+按当前 `MTFusion/none_debug`（`75c92fb`）核对，以下问题仍存在。
+
+## 会影响实验结果
+
+| 问题 | 当前影响 |
+|---|---|
+| **可见光和红外图可能静默错配** | 训练、验证和测试仍各自排序两路文件，再按位置配对，只检查数量。文件数量相同但文件名缺漏时，可能把不同场景当成一对。`split_msrs.py` 会检查同名 PNG，手工准备的目录仍有风险。 [数据加载](<E:/考研资料/复试/T/MTFusion/scripts/utils.py:71>) · [测试配对](<E:/考研资料/复试/T/MTFusion/test_from_dataset.py:46>) |
+| **GLCM 纹理属性计算有误** | 灰度图仍被压成一行，垂直和斜向失去有效像素对，转 `uint8` 可能回绕。可见光与红外的纹理权重仍用反，`energy` 和 `homogeneity` 的定义也与论文附录不同。 [纹理计算](<E:/考研资料/复试/T/MTFusion/scripts/utils.py:519>) |
+| **验证与独立测试走不同路径** | 验证的随机 dropout 已修，但仍用 BLIP 文本和训练模型的 TIAM。独立测试用属性和弱 TIAM，最佳权重仍按带文本的验证损失选择。 [验证前向](<E:/考研资料/复试/T/MTFusion/scripts/utils.py:372>) · [测试模型](<E:/考研资料/复试/T/MTFusion/model/TEDFusion_model.py:561>) |
+| **默认验证范围偏窄** | 只取中心 `96×96`，按任务顺序取前 80 对。第一个任务有足够样本时，后面的任务可能完全进不了验证。 [验证裁剪](<E:/考研资料/复试/T/MTFusion/train_fusion.py:175>) · [验证采样](<E:/考研资料/复试/T/MTFusion/data/prompt_dataset.py:73>) |
+| **原始尺寸和位深处理有问题** | 两路原图尺寸不同可能被裁剪或统一缩放掩盖。测试会缩小非 16 倍数的输入，短边不足 16 时会报错。16 位红外 PNG 直接转 RGB 会丢失高位深信息，本次复测 `256、2048、4096、65535` 全变成 `255`。筛选也仍会跳过 `.tif` 和 `.jpeg`。 [数据读入](<E:/考研资料/复试/T/MTFusion/data/prompt_dataset.py:106>) · [测试预处理](<E:/考研资料/复试/T/MTFusion/test_from_dataset.py:84>) |
+| **验证与测试的亮度口径不同** | 验证保留裁剪后的绝对亮度，测试对每张图做 min-max 拉伸。同一输出经过两条保存路径，亮度、对比度和相关指标可能不同。 [验证保存](<E:/考研资料/复试/T/MTFusion/scripts/utils.py:439>) · [测试保存](<E:/考研资料/复试/T/MTFusion/test_from_dataset.py:194>) |
+| **评估指标仍有计算错误** | PSNR 对非零误差固定偏高约 **48.13 dB**。SF、SCD、VIF 直接用 `uint8` 会回绕。SCD 遇到恒定残差可能产生 `NaN`。AG 的累加范围与分母不一致，Qabf 的等梯度分支有误，SSIM 会把 `[0,255]` 浮点输入再乘 255。SD 和 AG 直接接收三通道图也会报错。 [指标实现](<E:/考研资料/复试/T/MTFusion/metric/Metric.py:19>) · [Qabf](<E:/考研资料/复试/T/MTFusion/metric/Qabf.py:111>) · [SSIM](<E:/考研资料/复试/T/MTFusion/metric/ssim.py:99>) |
+
+## 训练与运行问题
+
+- **Checkpoint 保存与续训。** 默认第 3 个 epoch 才首次保存，验证损失为 `NaN` 仍可覆盖 `checkpoint_lastest.pth`。连续续训可能丢失上采样层的冻结状态，缩小每轮步数可能使学习率变成复数，命令行传入的学习率和权重衰减也会被恢复的优化器状态覆盖。 [续训](<E:/考研资料/复试/T/MTFusion/train_fusion.py:254>) · [保存](<E:/考研资料/复试/T/MTFusion/train_fusion.py:314>)
+- **非有限梯度缺少拦截。** 已修复此前发现的双曲计算触发点，但训练循环仍只检查损失。若其他算子产生非有限梯度，当前代码仍可能执行 `optimizer.step()`。 [训练循环](<E:/考研资料/复试/T/MTFusion/scripts/utils.py:234>)
+- **设备与模型参数支持不完整。** 训练损失和测试输入仍有硬编码 CUDA，测试忽略 `--gpu_id`。`--use_dp True` 解析成字符串，即使启用多卡，汇集后的双曲损失也需要额外归约。`dim=32` 仍会因解码器写死 `432` 通道而报错，本次已复测。 [设备参数](<E:/考研资料/复试/T/MTFusion/train_fusion.py:385>) · [解码器](<E:/考研资料/复试/T/MTFusion/model/TEDFusion_model.py:480>)
+- **运行开销。** 大图空间注意力显式构造位置间矩阵，显存开销随空间位置数平方增长。每轮训练和每次验证都会重载 BLIP，独立测试前向虽只用属性，入口仍加载 CLIP。 [空间注意力](<E:/考研资料/复试/T/MTFusion/model/TEDFusion_model.py:728>) · [BLIP 加载](<E:/考研资料/复试/T/MTFusion/scripts/utils.py:140>) · [测试入口](<E:/考研资料/复试/T/MTFusion/test_from_dataset.py:69>)
+- **损失日志少一项，环境文档有误。** `loss_consist` 计入总损失，但未单独记录。README 写的 `PyTorch 2.5.1 + pytorch-cuda 12.6` 没有对应的官方 Conda 构建。 [损失实现](<E:/考研资料/复试/T/MTFusion/scripts/losses.py:68>) · [PyTorch 版本表](https://pytorch.org/get-started/previous-versions/#v251)
+
+## 论文复现仍有缺口
+
+- **保留的实现差异。** ATGFM 沿用四组独立属性投影。推理沿用作者代码的属性驱动弱 TIAM，论文图 2 和正文对此描述不同。训练仍按亮度选整颗 RGB 像素，并保留一致性和颜色损失，与论文式（6）、（9）有差异。 [修复日志](<E:/考研资料/复试/T/MTFusion/修复日志.md:47>) · [论文方法](https://arxiv.org/html/2606.15104v2#S3)
+- **评估和消融入口未补齐。** 表 2 已能配置曲率，但其他消融缺少完整入口，实验 V 的“去掉双曲损失”和“改用欧氏距离”仍有歧义。表 1 缺批量指标汇总，表 3 缺检测和分割流程。修复后的真实 MSRS 整轮训练和论文指标仍待验证。 [论文实验](https://arxiv.org/html/2606.15104v2#S4) · [验证记录](<E:/考研资料/复试/T/MTFusion/修复日志.md:109>)
