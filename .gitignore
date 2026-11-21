@@ -9,4 +9,9 @@ __pycache__/
 
 /pretrained_weights
 
+ViT-B-32.pt
 
+/results
+
+
+/GLCM_hyperbolic.log
