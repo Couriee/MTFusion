@@ -51,7 +51,7 @@ class HyperbolicGeometryTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(tangent.grad).all())
         self.assertTrue(torch.isfinite(anchor_tangent.grad).all())
 
-    def test_scale_weight_uses_spatial_mean_of_origin_distances(self):
+    def test_loss_uses_spatial_mean_without_radial_discount(self):
         curvature = torch.tensor(0.7, dtype=torch.float64)
         image = torch.tensor([[[0.1], [0.3]], [[0.5], [0.7]]], dtype=torch.float64)
         anchor = torch.tensor([[[0.2]], [[0.1]]], dtype=torch.float64)
@@ -60,14 +60,36 @@ class HyperbolicGeometryTests(unittest.TestCase):
         for pixels, text in zip(((0.1, 0.3), (0.5, 0.7)), (0.2, 0.1)):
             pixel_radii = [2 * math.atanh(sqrt_c * value) / sqrt_c for value in pixels]
             anchor_radius = 2 * math.atanh(sqrt_c * text) / sqrt_c
-            scale_radius = sum(pixel_radii) / len(pixel_radii)
-            weight = math.exp(-abs(scale_radius - anchor_radius) / 0.5)
             mean_distance = sum(abs(radius - anchor_radius) for radius in pixel_radii) / len(pixels)
-            expected.append(weight * mean_distance)
+            expected.append(mean_distance)
         torch.testing.assert_close(
             geometry.poincare_loss(image, anchor, curvature),
             torch.tensor(expected, dtype=image.dtype),
         )
+
+    def test_increasing_radial_distance_cannot_discount_its_own_loss(self):
+        # The old loss d * exp(-d / 0.5) decreased for d > 0.5. With an
+        # origin anchor, exp_map([r, 0]) has geodesic distance exactly 2r.
+        for curvature_value in (0.5, 0.7, 1.0):
+            with self.subTest(curvature=curvature_value):
+                curvature = torch.tensor(curvature_value, dtype=torch.float64)
+                radii = torch.tensor([0.1, 0.25, 0.5, 1.0, 2.0, 3.0], dtype=torch.float64)
+                tangent = torch.stack([radii, torch.zeros_like(radii)], dim=-1).unsqueeze(1)
+                tangent.requires_grad_()
+                anchor = torch.zeros(len(radii), 1, 2, dtype=torch.float64)
+                loss = geometry.poincare_loss(geometry.exp_map(tangent, curvature), anchor, curvature)
+                torch.testing.assert_close(loss, 2 * radii)
+                self.assertTrue((loss[1:] > loss[:-1]).all())
+                loss.sum().backward()
+                self.assertTrue((tangent.grad[:, 0, 0] > 0).all())
+                self.assertTrue(torch.isfinite(tangent.grad).all())
+
+                # Increasing just one of four scales cannot be hidden by
+                # reducing its weight or the total mass of all scale weights.
+                other_scales = torch.full_like(loss, 0.2)
+                total = torch.stack((loss, other_scales, other_scales, other_scales)).mean(dim=0)
+                torch.testing.assert_close(total, (2 * radii + 0.6) / 4)
+                self.assertTrue((total[1:] > total[:-1]).all())
 
     def test_guidance_maps_channel_vectors_and_reuses_translated_points(self):
         layer = geometry.FeatureWiseAffine(8, 4, curvature=0.7)
@@ -162,6 +184,48 @@ class HyperbolicModelTests(unittest.TestCase):
                 first_eval = model(self.a, self.b, self.text, self.text, self.attributes)
                 second_eval = model(self.a, self.b, self.text * 2, self.text * 3, self.attributes)
             self.assertFalse(torch.equal(first_eval[2], second_eval[2]))
+
+    def test_attribute_only_validation_and_deployed_model_are_identical(self):
+        training_model = self.make_model(geometry.TEDFusion).eval()
+        deployed_model = self.make_model(geometry.TEDFusion1).eval()
+        # This is the pre-existing checkpoint difference: the training-only
+        # conv48to384 is registered but never used by either image path.
+        state = {
+            key: value for key, value in training_model.state_dict().items()
+            if not key.startswith("conv48to384.")
+        }
+        incompatible = deployed_model.load_state_dict(state, strict=True)
+        self.assertEqual(incompatible.missing_keys, [])
+        self.assertEqual(incompatible.unexpected_keys, [])
+        with (
+            torch.no_grad(),
+            patch.object(ClipProbe, "encode_text", side_effect=AssertionError("deployment used captions")),
+            patch.object(torch, "rand_like", side_effect=AssertionError("deployment sampled text dropout")),
+        ):
+            plain = training_model.forward_inference(self.a, self.b, self.attributes)
+            details = training_model.forward_inference(self.a, self.b, self.attributes, return_details=True)
+            deployed = deployed_model(self.a, self.b, self.attributes)
+            deployed_details = deployed_model.forward_inference(
+                self.a, self.b, self.attributes, return_details=True
+            )
+        torch.testing.assert_close(plain, details[0], rtol=0, atol=0)
+        torch.testing.assert_close(plain, deployed, rtol=0, atol=0)
+        for first, second in zip(details, deployed_details):
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+        self.assertEqual(details[1].shape, (2, 64))
+        self.assertEqual(details[2].shape, (2, 64))
+        torch.testing.assert_close(details[1], torch.zeros_like(details[1]), rtol=0, atol=0)
+        self.assertEqual(details[3].ndim, 0)
+        self.assertTrue(torch.isfinite(details[3]))
+
+    def test_full_attribute_dropout_uses_the_same_deployment_operator(self):
+        model = self.make_model(geometry.TEDFusion).train()
+        model.drop_prob = 1.0
+        with torch.no_grad():
+            training = model(self.a, self.b, self.text, self.text * 3, self.attributes)
+            inference = model.forward_inference(self.a, self.b, self.attributes, return_details=True)
+        for index in (0, 2, 3):
+            torch.testing.assert_close(training[index], inference[index], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

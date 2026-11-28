@@ -43,8 +43,10 @@ def _stage_extractor(tree, namespace, function_name):
     """Execute the attribute statements actually used by a stage's loop."""
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == function_name)
     model_call = next(node for node in ast.walk(function)
-                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                      and node.func.id == 'model')
+                      if isinstance(node, ast.Call) and (
+                          isinstance(node.func, ast.Name) and node.func.id == 'model'
+                          or isinstance(node.func, ast.Attribute) and node.func.attr == 'forward_inference'
+                      ))
     # Bind images in the order actually passed to the model. Normalizing the
     # attribute variable names alone would hide a reversed VI/IR order.
     image_names = tuple(node.id for node in model_call.args[:2])

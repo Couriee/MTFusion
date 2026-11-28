@@ -10,6 +10,7 @@ from torchvision.transforms import functional as F
 
 from model.TEDFusion_model import TEDFusion1 as create_model1
 from scripts.image_output import existing_image_names, reserve_image_stem, write_image
+from scripts.inference import crop_to_original, pad_image_pair
 
 
 import argparse
@@ -83,30 +84,22 @@ def main(args):
         assert os.path.exists(ir_path), "file: '{}' dose not exist.".format(ir_path)
         assert os.path.exists(vi_path), "file: '{}' dose not exist.".format(vi_path)
 
-        ir = Image.open(ir_path).convert(mode="RGB")
-        vi = Image.open(vi_path).convert(mode="RGB")
-
-        height, width = vi.size
-
-        new_width = (width // 16) * 16
-
-        new_height = (height // 16) * 16
-
-        # new_width = (width * 16.0) / 16.0
-        #
-        # new_height = (height * 16.0) / 16.0
-
-
-        ir = ir.resize((new_height, new_width))
-        vi = vi.resize((new_height, new_width))
+        with Image.open(ir_path) as source:
+            ir = source.convert(mode="RGB")
+        with Image.open(vi_path) as source:
+            vi = source.convert(mode="RGB")
+        if vi.size != ir.size:
+            raise ValueError("Original paired image sizes must match: {} {} and {} {}".format(
+                vi_path, vi.size, ir_path, ir.size
+            ))
 
         ir = F.to_tensor(ir)
         vi = F.to_tensor(vi)
 
 
 
-        ir = ir.unsqueeze(0).cuda()
-        vi = vi.unsqueeze(0).cuda()
+        ir = ir.unsqueeze(0).to(device)
+        vi = vi.unsqueeze(0).to(device)
 
         _check_rgb_batch(vi)
         _check_rgb_batch(ir)
@@ -136,18 +129,12 @@ def main(args):
             dtype=torch.float32, device=vi.device,
         )
 
+        # Measure attributes on the original pixels; padding is only a model
+        # shape requirement and must not change the exported field of view.
+        vi, ir, original_size = pad_image_pair(vi, ir)
         with torch.no_grad():
-            # text = clip.tokenize(text_line).to(device)
-            # text1 = clip.tokenize(text_line[0]).to(device)
-            # text2 = clip.tokenize(text_line[1]).to(device)
-            # text3 = clip.tokenize(text_line[2]).to(device)
-            # text4 = clip.tokenize(text_line[3]).to(device)
-            i = model(vi, ir,feature)
-
-            text1 = torch.tensor(0)
-            text2 = torch.tensor(0)
-            # i = model(vi, ir, feature,text1,text2)
-            fused_img_Y = tensor2numpy(i)
+            fused = model(vi, ir, feature)
+            fused_img_Y = tensor2numpy(crop_to_original(fused, original_size))
 
             save_pic(fused_img_Y, save_path, img_name)
 
@@ -194,10 +181,9 @@ def _output_names(visible_paths, save_path):
 
 
 def save_pic(outputpic, path, index: str):
-    outputpic[outputpic > 1.] = 1
-    outputpic[outputpic < 0.] = 0
-    outputpic = cv2.UMat(outputpic).get()
-    outputpic = cv2.normalize(outputpic, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_32F)
+    # Use the same absolute-intensity quantization as validation. Per-image
+    # min-max stretching changes the experiment's brightness and contrast.
+    outputpic = np.rint(np.clip(outputpic, 0.0, 1.0) * 255.0).astype(np.uint8)
     outputpic = outputpic[:, :, ::-1]
     write_image(os.path.join(path, index), outputpic)
 

@@ -33,6 +33,18 @@ python train_fusion.py `
   --grad_clip_norm 1.0
 ```
 
+Validation now uses every full-size image pair by default (`--max_val_samples 0`)
+and runs the same attribute-only path as standalone inference. A positive cap
+selects deterministic samples across tasks rather than a filename prefix.
+Inference pads and crops to preserve source size, and exports absolute intensity.
+
+New checkpoints record experiment protocol version 2. Continue these experiments
+with `--resume`; omitted epoch, batch-size, sampling and optimizer settings are
+restored and conflicting settings are rejected. To initialize a new experiment
+from an older checkpoint, use `--weights` instead. The hyperbolic objective and
+inference protocol changed; previous metrics require a new evaluation.
+See [the before/after repair record](修复日志.md) for implementation and validation.
+
 
 ✔️Testing
 ----

@@ -72,7 +72,7 @@ class fusion_loss(nn.Module):
         loss_color = color_ratio * self.loss_func_color(image_visible, image_fused)
         loss_text = text_ratio * self.loss_func_Grad(image_visible_gray, image_infrared_gray, image_fused_gray)
         # loss_semantic = 0.5 * self.loss_func_sementic(htext,hattr)
-        loss_semantic = torch.tensor(0).to("cuda:0")
+        loss_semantic = image_fused.new_zeros(())
         loss_hyperbolic = 0.005 * distance_all
 
         total_loss = loss_ssim + loss_max + loss_consist + loss_color + loss_text + loss_semantic + loss_hyperbolic
@@ -181,10 +181,10 @@ class GradientMaxLoss(nn.Module):
         super(GradientMaxLoss, self).__init__()
         self.sobel_x = nn.Parameter(torch.FloatTensor([[-1, 0, 1],
                                                        [-2, 0, 2],
-                                                       [-1, 0, 1]]).view(1, 1, 3, 3), requires_grad=False).cuda()
+                                                       [-1, 0, 1]]).view(1, 1, 3, 3), requires_grad=False)
         self.sobel_y = nn.Parameter(torch.FloatTensor([[-1, -2, -1],
                                                        [0, 0, 0],
-                                                       [1, 2, 1]]).view(1, 1, 3, 3), requires_grad=False).cuda()
+                                                       [1, 2, 1]]).view(1, 1, 3, 3), requires_grad=False)
         self.padding = (1, 1, 1, 1)
 
     def forward(self, image_A, image_B, image_fuse):
@@ -319,14 +319,16 @@ class L_SSIM(torch.nn.Module):
             img1 = torch.concat([img1, img1, img1], dim=1)
             channel = 3
 
-        if channel == self.channel and self.window.dtype == img1.dtype:
-            window = self.window.cuda()
+        real_window_size = min(self.window_size, img1.shape[-2], img1.shape[-1])
+        if (channel == self.channel and self.window.dtype == img1.dtype
+                and self.window.shape[-1] == real_window_size):
+            window = self.window.to(device=img1.device, dtype=img1.dtype)
         else:
-            window = create_window(self.window_size, channel).to(img1.device).type(img1.dtype)
-            self.window = window.cuda()
+            window = create_window(real_window_size, channel).to(img1.device).type(img1.dtype)
+            self.window = window
             self.channel = channel
 
-        return ssim(img1, img2, window=window, window_size=self.window_size, size_average=self.size_average)
+        return ssim(img1, img2, window=window, window_size=real_window_size, size_average=self.size_average)
 
 
 def structure_loss(img1, img2, window_size=11, window=None, size_average=True, full=False, val_range=None):

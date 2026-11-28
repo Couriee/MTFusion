@@ -12,6 +12,10 @@ from data.simple_dataset import SimpleDataSet
 from model.TEDFusion_model import TEDFusion as create_model
 from model.TEDFusion_model import validate_curvature
 from scripts.utils import read_data, train_one_epoch, evaluate, create_lr_scheduler
+from scripts.training_state import (
+    resolve_training_mode, make_schedule_plan, resolve_schedule_plan,
+    validate_resume_protocol, EXPERIMENT_PROTOCOL_VERSION,
+)
 import datetime
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -99,8 +103,11 @@ def main(args):
     checkpoint_args = None
     initial_weights = None
     curvature = getattr(args, "curvature", None)
+    if args.resume and args.weights:
+        raise ValueError("--resume and --weights cannot be combined.")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        validate_resume_protocol(checkpoint)
         checkpoint_args = checkpoint.get("args")
         saved_curvature = checkpoint.get("curvature", 1.0)
         if curvature is not None and curvature != saved_curvature:
@@ -112,6 +119,48 @@ def main(args):
             curvature = initial_weights.get("curvature", 1.0)
     args.curvature = validate_curvature(1.0 if curvature is None else curvature)
     print("TIAM curvature: {}".format(args.curvature))
+
+    scheduler_plan = None
+    if checkpoint is not None:
+        scheduler_plan = resolve_schedule_plan(
+            checkpoint, requested_epochs=args.epochs,
+            requested_batch_size=args.batch_size,
+            requested_samples_per_epoch=args.samples_per_epoch,
+        )
+        args.epochs = scheduler_plan["total_epochs"]
+        args.batch_size = scheduler_plan["batch_size"]
+        args.samples_per_epoch = scheduler_plan["samples_per_epoch"]
+        if args.batch_size is None or args.samples_per_epoch is None:
+            raise ValueError("Resume checkpoint has incomplete loader settings. Use --weights for a new experiment.")
+        saved_args = vars(checkpoint_args) if not isinstance(checkpoint_args, dict) else checkpoint_args
+        saved_args = saved_args or {}
+        saved_cap = saved_args.get("max_val_samples", 0)
+        if args.max_val_samples is not None and args.max_val_samples != saved_cap:
+            raise ValueError("--resume requires the original validation sample cap. Use --weights for a new experiment.")
+        args.max_val_samples = saved_cap
+        saved_clip = saved_args.get("grad_clip_norm", 1.0)
+        if args.grad_clip_norm is not None and args.grad_clip_norm != saved_clip:
+            raise ValueError("--resume cannot change gradient clipping. Use --weights for a new experiment.")
+        args.grad_clip_norm = saved_clip
+        for name in ("dataset_path", "low_light_path", "over_exposure_path", "ir_low_contrast_path", "ir_noise_path"):
+            if getattr(args, name) is None:
+                setattr(args, name, saved_args.get(name))
+        base_lr = checkpoint["lr_scheduler"]["base_lrs"][0]
+        saved_decay = checkpoint["optimizer"]["param_groups"][0]["weight_decay"]
+        if args.lr is not None and args.lr != base_lr:
+            raise ValueError("--resume cannot change the original base learning rate. Use --weights for a new experiment.")
+        if args.weight_decay is not None and args.weight_decay != saved_decay:
+            raise ValueError("--resume cannot change weight decay. Use --weights for a new experiment.")
+        args.lr, args.weight_decay = base_lr, saved_decay
+    else:
+        args.epochs = 15 if args.epochs is None else args.epochs
+        args.batch_size = 2 if args.batch_size is None else args.batch_size
+        args.samples_per_epoch = 800 if args.samples_per_epoch is None else args.samples_per_epoch
+        args.max_val_samples = 0 if args.max_val_samples is None else args.max_val_samples
+        args.grad_clip_norm = 1.0 if args.grad_clip_norm is None else args.grad_clip_norm
+    for name in ("low_light_path", "over_exposure_path", "ir_low_contrast_path", "ir_noise_path"):
+        if getattr(args, name) is None:
+            setattr(args, name, "./dataset/train_MSRS")
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     set_seed(TRAIN_SEED)
@@ -172,9 +221,7 @@ def main(args):
                             T.RandomVerticalFlip(0.5),
                             T.ToTensor()]),
 
-        "val": T.Compose([T.CenterCrop(96),
-                          T.Resize_16(),
-                          T.ToTensor()])}
+        "val": T.Compose([T.ToTensor()])}
 
     train_dataset = PromptDataSet(train_low_light_path_list=train_low_light_path_list,
                                   val_low_light_path_list=val_low_light_path_list,
@@ -253,11 +300,20 @@ def main(args):
             initialized_parameters
         ))
 
-    resumed_from_pretrained = bool(getattr(checkpoint_args, "weights", ""))
-    is_finetuning = args.weights != "" or resumed_from_pretrained
-    checkpoint_trained_upsamplers = bool(getattr(checkpoint_args, "train_upsamplers", False))
-    protect_upsamplers = is_finetuning and not (args.train_upsamplers or checkpoint_trained_upsamplers)
-    if protect_upsamplers:
+    candidates = [(name, p) for name, p in model.named_parameters()
+                  if p.requires_grad or name.endswith(".log_c")]
+    upsample_prefixes = tuple(name + "." for name in UPSAMPLE_MODULE_NAMES)
+    optimizer_param_counts = {
+        "unfrozen": len(candidates),
+        "frozen": sum(not name.startswith(upsample_prefixes) for name, _ in candidates),
+    }
+    training_state = resolve_training_mode(
+        checkpoint, initial_weights=bool(args.weights),
+        train_upsamplers=args.train_upsamplers,
+        optimizer_param_counts=optimizer_param_counts,
+    )
+    is_finetuning = training_state["fine_tuning"]
+    if training_state["freeze_upsamplers"]:
         frozen_parameters = freeze_pretrained_upsamplers(model)
         print("Fine-tuning guard: froze {:,} pretrained PixelShuffle-convolution parameters.".format(
             frozen_parameters
@@ -274,9 +330,21 @@ def main(args):
     weight_decay = args.weight_decay
     if weight_decay is None:
         weight_decay = 1e-4 if is_finetuning else 5e-2
-    print("Optimizer: AdamW(lr={}, weight_decay={})".format(learning_rate, weight_decay))
     optimizer = optim.AdamW(pg, lr=learning_rate, weight_decay=weight_decay)
-    lr_scheduler = create_lr_scheduler(optimizer, len(train_loader), args.epochs, warmup=True)
+    if checkpoint is not None:
+        scheduler_plan = resolve_schedule_plan(
+            checkpoint, requested_steps_per_epoch=len(train_loader),
+            requested_epochs=args.epochs, requested_batch_size=args.batch_size,
+            requested_samples_per_epoch=args.samples_per_epoch,
+        )
+    else:
+        scheduler_plan = make_schedule_plan(
+            len(train_loader), args.epochs, batch_size=args.batch_size,
+            samples_per_epoch=args.samples_per_epoch,
+        )
+    lr_scheduler = create_lr_scheduler(
+        optimizer, len(train_loader), args.epochs, plan=scheduler_plan
+    )
 
     if checkpoint is not None:
         checkpoint_seed = checkpoint.get("seed", getattr(checkpoint.get("args"), "seed", None))
@@ -293,6 +361,10 @@ def main(args):
             set_rng_state(checkpoint["rng_state"], train_generator, val_generator)
         else:
             print("WARNING: checkpoint has no RNG state; resumed training cannot be exactly reproduced.")
+
+    print("Optimizer: AdamW(current_lr={}, base_lr={}, weight_decay={})".format(
+        optimizer.param_groups[0]["lr"], lr_scheduler.base_lrs[0], optimizer.param_groups[0]["weight_decay"]
+    ))
 
     for epoch in range(start_epoch, args.epochs):
         # train
@@ -342,6 +414,9 @@ def main(args):
                 "seed": TRAIN_SEED,
                 "best_val_loss": best_val_loss,
                 "rng_state": get_rng_state(train_generator, val_generator),
+                "training_state": training_state,
+                "scheduler_plan": scheduler_plan,
+                "experiment_protocol_version": EXPERIMENT_PROTOCOL_VERSION,
             }
 
             if is_best:
@@ -353,34 +428,34 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # parser.add_argument('--epochs', type=int, default=120)
-    parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--epochs', type=int, default=None, help='total epochs (fresh: 15; resume: restore original plan)')
 
     # set the appropriate batch-size value for your device
     # parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--batch-size', type=int, default=2)
+    parser.add_argument('--batch-size', type=int, default=None, help='batch size (fresh: 2; resume: restore saved value)')
     parser.add_argument('--lr', type=float, default=None,
                         help='learning rate (default: 2e-5 for fine-tuning, 1e-4 from scratch)')
     parser.add_argument('--weight_decay', type=float, default=None,
                         help='AdamW weight decay (default: 1e-4 for fine-tuning, 5e-2 from scratch)')
-    parser.add_argument('--grad_clip_norm', type=float, default=1.0,
+    parser.add_argument('--grad_clip_norm', type=float, default=None,
                         help='clip gradient norm to stabilize fine-tuning; <=0 disables it')
-    parser.add_argument('--samples_per_epoch', type=int, default=800,
+    parser.add_argument('--samples_per_epoch', type=int, default=None,
                         help='random training pairs drawn per epoch; 800 matches the original small-MSRS run')
-    parser.add_argument('--max_val_samples', type=int, default=80,
-                        help='maximum number of deterministic validation pairs')
+    parser.add_argument('--max_val_samples', type=int, default=None,
+                        help='validation cap (fresh default: 0=all; positive: balanced coverage across tasks)')
     parser.add_argument('--curvature', type=float, default=None,
                         help='fixed TIAM curvature (defaults to the checkpoint value or 1.0)')
 
     parser.add_argument('--dataset_path', type=str, default=None,
                         help='set one dataset root for all four task slots')
-    parser.add_argument('--low_light_path', type=str, default="./dataset/train_MSRS")
-    parser.add_argument('--over_exposure_path', type=str, default="./dataset/train_MSRS")
-    parser.add_argument('--ir_low_contrast_path', type=str, default="./dataset/train_MSRS")
-    parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--low_light_path', type=str, default=None)
+    parser.add_argument('--over_exposure_path', type=str, default=None)
+    parser.add_argument('--ir_low_contrast_path', type=str, default=None)
+    parser.add_argument('--ir_noise_path', type=str, default=None)
 
     parser.add_argument('--weights', type=str, default='',
                         help='trusted local checkpoint for initial weights')
-    parser.add_argument('--train_upsamplers', action='store_true',
+    parser.add_argument('--train_upsamplers', action='store_true', default=None,
                         help='also update PixelShuffle convolutions when fine-tuning (not recommended for MSRS)')
     parser.add_argument('--val_every_epcho', type=int, default=2, help='val every epcho')
     parser.add_argument('--resume', default='', help='resume from a trusted local checkpoint')

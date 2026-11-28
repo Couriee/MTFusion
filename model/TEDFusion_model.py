@@ -63,12 +63,14 @@ def hyperbolic_norm(x, c=1.0):
     return (2 / sqrt_c) * torch.atanh(sqrt_c * x.norm(dim=-1))
 
 
-def poincare_loss(translated, anchor, c, tau=0.5):
-    """One weighted distance per image and scale, following equations (3)-(4)."""
-    image_norm = hyperbolic_norm(translated, c).mean(dim=1)
-    anchor_norm = hyperbolic_norm(anchor, c).squeeze(1)
-    weight = torch.exp(-(image_norm - anchor_norm).abs() / tau)
-    return weight * poincare_distance(translated, anchor, c).mean(dim=1)
+def poincare_loss(translated, anchor, c):
+    """Mean distance per image; all scales receive constant, equal weight.
+
+    A learned radial weight can approach zero by increasing the very distance
+    being penalized. Keeping the distance unweighted removes that escape route.
+    This deliberately changes the previous exponential-weighted objective.
+    """
+    return poincare_distance(translated, anchor, c).mean(dim=1)
 
 
 def shared_text_anchor(condition, guidance_levels):
@@ -190,7 +192,92 @@ class PatchFlattener1(nn.Module):
 
 #
 
-class TEDFusion(nn.Module):
+class _FusionForwardMixin:
+    """Shared attribute and image paths without changing checkpoint parameters."""
+
+    def _attribute_parts(self, inp_img_A, feature):
+        batch = inp_img_A.shape[0]
+        if feature.ndim == 1 and batch == 1:
+            feature = feature.unsqueeze(0)
+        if feature.shape != (batch, 8):
+            raise ValueError("Expected per-image attributes [{},8], got {}".format(
+                batch, tuple(feature.shape)
+            ))
+        projections = (self.attr_proj1, self.attr_proj2, self.attr_proj3, self.attr_proj4)
+        return tuple(projection(part) for projection, part in zip(projections, feature.chunk(4, dim=1)))
+
+    def _decode_images(self, inp_img_A, inp_img_B, condition, *, measure_distance):
+        anchor, curvature = shared_text_anchor(condition, (
+            self.prompt_guidance_1, self.prompt_guidance_2,
+            self.prompt_guidance_3, self.prompt_guidance_4,
+        ))
+        self.isss += 1
+
+        x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A)
+        x4_B, x3_B, x2_B, x1_B = self.encoder_B(inp_img_B)
+        x4_A = self.attention_spatial(x4_A)
+        x4_B = self.attention_spatial(x4_B)
+        x4_A, x4_B = self.cross_attention(x4_A, x4_B)
+
+        x4 = self.feature_fusion_4(x4_A, x4_B)
+        x4, distance4 = self.prompt_guidance_4(
+            x4, anchor, curvature, measure_distance=measure_distance
+        )
+        outd4 = self.decoder_level4(x4)
+
+        inp3 = self.up4_3(outd4)
+        inp3, distance3 = self.prompt_guidance_3(
+            inp3, anchor, curvature, measure_distance=measure_distance
+        )
+        x3 = self.feature_fusion_3(x3_A, x3_B)
+        inp31 = self.reduce_chan_level3(torch.cat([inp3, x3], 1))
+        outd31 = self.decoder_level3(inp31)
+
+        inp2 = self.up3_2(outd31)
+        inp2, distance2 = self.prompt_guidance_2(
+            inp2, anchor, curvature, measure_distance=measure_distance
+        )
+        x2 = self.feature_fusion_2(x2_A, x2_B)
+        inp21 = torch.cat([x2, self.up3_2(x3)], 1)
+        inp22 = self.reduce_chan_level2(torch.cat([inp21, x2, inp2], 1))
+        outd22 = self.decoder_level2(inp22)
+
+        inp1 = self.up2_1(outd22)
+        inp1, distance1 = self.prompt_guidance_1(
+            inp1, anchor, curvature, measure_distance=measure_distance
+        )
+        x1 = self.feature_fusion_1(x1_A, x1_B)
+        inp11 = torch.cat([x1, self.up2_1(x2)], 1)
+        inp12 = torch.cat([x1, inp11, self.up2_1_2(inp21)], 1)
+        inp13 = self.reduce_chan_level1(torch.cat([x1, inp11, inp12, inp1], 1))
+        outd1 = self.refinement(self.decoder_level1(inp13))
+        outd1 = self.output4(self.output3(self.output2(self.output1(outd1))))
+
+        distance_all = None
+        if measure_distance:
+            # Equal weights sum to one and cannot be shrunk by feature radii.
+            distance_all = torch.stack((distance1, distance2, distance3, distance4)).mean()
+        return outd1, distance_all
+
+    def forward_inference(self, inp_img_A, inp_img_B, feature, return_details=False):
+        """Run the deployment path without captions or random text dropout.
+
+        Set return_details for the training loss interface. Its htext slot is
+        zero because deployment has no text; it is not a CLIP embedding.
+        Call eval() separately when evaluating, as for ordinary forward().
+        """
+        attributes = self._attribute_parts(inp_img_A, feature)
+        image, distance = self._decode_images(
+            inp_img_A, inp_img_B, torch.cat(attributes, dim=1),
+            measure_distance=return_details,
+        )
+        if return_details:
+            hattr = torch.stack(attributes).sum(dim=0)
+            return [image, torch.zeros_like(hattr), hattr, distance]
+        return image
+
+
+class TEDFusion(_FusionForwardMixin, nn.Module):
     def __init__(self, model_clip, inp_A_channels=3, inp_B_channels=3, out_channels=3,
                  dim=48, num_blocks=[2, 2, 2, 2],
                  num_refinement_blocks=4,
@@ -304,41 +391,12 @@ class TEDFusion(nn.Module):
         # self.drop_prob = 1
         # self.dummy_text = nn.Parameter(torch.randn(1, 64))
 
-    def forward(self, inp_img_A, inp_img_B, text1,text2,feature):
-        b = inp_img_A.shape[0]
-        # text1 = text1.float()
-        # text2 = text2.float()
-        # text = text.mean(dim=0)
-
-        # feature = torch.relu(self.fc1(feature))
-        # feature = self.fc2(feature)
-        # feature = torch.sigmoid(feature)
-
-        if feature.ndim == 1 and b == 1:
-            feature = feature.unsqueeze(0)
-        if feature.shape != (b, 8):
-            raise ValueError("Expected per-image attributes [{},8], got {}".format(
-                b, tuple(feature.shape)
-            ))
-
-        f1,f2,f3,f4 = feature.chunk(4, dim=1)
-
-
-
-        # print(f1.shape)
-        # 属性特征映射
-        h_attr1 = self.attr_proj1(f1).expand(b, -1)
-        h_attr2 = self.attr_proj2(f2).expand(b, -1)
-        h_attr3 = self.attr_proj3(f3).expand(b, -1)
-        h_attr4 = self.attr_proj4(f4).expand(b, -1)
-
-        h_text1 = self.get_text_feature(text1.expand(b, -1)).to(inp_img_A.dtype)
-        h_text2 = self.get_text_feature(text2.expand(b, -1)).to(inp_img_A.dtype)
-
-        h_text1 = self.text_proj21(h_text1)
-        h_text2 = self.text_proj22(h_text2)
-        h_text = torch.cat([h_text1,h_text2],dim=1)
-
+    def forward(self, inp_img_A, inp_img_B, text1, text2, feature):
+        batch = inp_img_A.shape[0]
+        attributes = self._attribute_parts(inp_img_A, feature)
+        h_text1 = self.get_text_feature(text1.expand(batch, -1)).to(inp_img_A.dtype)
+        h_text2 = self.get_text_feature(text2.expand(batch, -1)).to(inp_img_A.dtype)
+        h_text = torch.cat([self.text_proj21(h_text1), self.text_proj22(h_text2)], dim=1)
 
         if self.training and self.is_training:
             replace_text = torch.rand_like(h_text[:, :1]) < self.drop_prob
@@ -346,87 +404,21 @@ class TEDFusion(nn.Module):
             replace_text = torch.full_like(h_text[:, :1], not self.is_training, dtype=torch.bool)
 
         fused_parts = []
-        for attribute in (h_attr1, h_attr2, h_attr3, h_attr4):
+        for attribute in attributes:
             condition = torch.where(replace_text, attribute, h_text)
             gate = self.fusion_gate(torch.cat([attribute, condition], dim=1))
             fused_parts.append(torch.lerp(condition, attribute, gate))
-
-        fused = torch.cat(fused_parts, dim=1)
-        fusedd = torch.stack(fused_parts).sum(dim=0)
-        anchor, curvature = shared_text_anchor(fused, (
-            self.prompt_guidance_1, self.prompt_guidance_2,
-            self.prompt_guidance_3, self.prompt_guidance_4,
-        ))
-        self.isss += 1
-
-        x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A) #4:[384,12,12] 3:[192,24,24] 2:[96,48,48] 1:[48,96,96]
-        x4_B, x3_B, x2_B, x1_B = self.encoder_B(inp_img_B)
-
-        x4_A = self.attention_spatial(x4_A)
-        x4_B = self.attention_spatial(x4_B)
-
-
-
-        x4_A, x4_B = self.cross_attention(x4_A, x4_B)
-
-        x4 = self.feature_fusion_4(x4_A, x4_B)
-        # x4 = self.attention_spatial(x4)
-
-        x4, distance4 = self.prompt_guidance_4(x4, anchor, curvature)
-        inp4 = x4
-        outd4 = self.decoder_level4(inp4)
-
-        inp3 = self.up4_3(outd4)
-        inp3, distance3 = self.prompt_guidance_3(inp3, anchor, curvature)
-        x3 = self.feature_fusion_3(x3_A, x3_B)
-        inp31 = torch.cat([inp3, x3], 1)
-        inp31 = self.reduce_chan_level3(inp31)
-        outd31 = self.decoder_level3(inp31)
-
-        inp2 = self.up3_2(outd31)
-        inp2, distance2 = self.prompt_guidance_2(inp2, anchor, curvature)
-        x2 = self.feature_fusion_2(x2_A, x2_B)
-        inp21 = torch.cat([x2, self.up3_2(x3)], 1)
-        inp22 = torch.cat([inp21,x2,inp2], 1)
-        inp22 = self.reduce_chan_level2(inp22)
-        outd22 = self.decoder_level2(inp22)
-
-        inp1 = self.up2_1(outd22)
-        inp1, distance1 = self.prompt_guidance_1(inp1, anchor, curvature)
-        x1 = self.feature_fusion_1(x1_A, x1_B)
-        inp11 = torch.cat([x1, self.up2_1(x2)], 1)
-
-        inp12 = torch.cat([x1, inp11, self.up2_1_2(inp21)], 1)
-        inp13 = torch.cat([x1, inp11, inp12, inp1], 1)
-
-        inp13 = self.reduce_chan_level1(inp13)
-
-        outd1 = self.decoder_level1(inp13)
-
-        outd1 = self.refinement(outd1)
-
-
-
-        outd1 = self.output1(outd1)
-        outd1 = self.output2(outd1)
-        outd1 = self.output3(outd1)
-        outd1 = self.output4(outd1)
-
-
-
-        distance_all = torch.stack((distance1, distance2, distance3, distance4)).mean()
-
-        return [outd1,h_text,fusedd,distance_all]
+        image, distance = self._decode_images(
+            inp_img_A, inp_img_B, torch.cat(fused_parts, dim=1), measure_distance=True
+        )
+        return [image, h_text, torch.stack(fused_parts).sum(dim=0), distance]
 
     @torch.no_grad()
     def get_text_feature(self, text):
         text_feature = self.model_clip.encode_text(text)
         return text_feature
 
-class TEDFusion1(nn.Module):
-    # All four TIAM levels are active, but remain weak to preserve metrics.
-    tiam_strength = 0.002
-
+class TEDFusion1(_FusionForwardMixin, nn.Module):
     def __init__(self, model_clip, inp_A_channels=3, inp_B_channels=3, out_channels=3,
                  dim=48, num_blocks=[2, 2, 2, 2],
                  num_refinement_blocks=4,
@@ -558,99 +550,8 @@ class TEDFusion1(nn.Module):
         self.all_samples = []
         self.sample_names = []
 
-    def _apply_weak_tiam(self, x, anchor, curvature, gate_control, guidance_module):
-        guided, _ = guidance_module(x, anchor, curvature, measure_distance=False)
-        strength = self.tiam_strength * (0.5 + gate_control)
-        return x + strength * (guided - x)
-
-    def forward(self, inp_img_A, inp_img_B,feature):
-        b = inp_img_A.shape[0]
-        if feature.ndim == 1 and b == 1:
-            feature = feature.unsqueeze(0)
-        if feature.shape != (b, 8):
-            raise ValueError("Expected per-image attributes [{},8], got {}".format(
-                b, tuple(feature.shape)
-            ))
-
-        # ATGFM inference: attributes replace the unavailable text branch.
-        f1, f2, f3, f4 = feature.chunk(4, dim=1)
-        h_attr1 = self.attr_proj1(f1)
-        h_attr2 = self.attr_proj2(f2)
-        h_attr3 = self.attr_proj3(f3)
-        h_attr4 = self.attr_proj4(f4)
-
-        gates = [
-            self.fusion_gate(torch.cat([h_attr1, h_attr1], dim=1)),
-            self.fusion_gate(torch.cat([h_attr2, h_attr2], dim=1)),
-            self.fusion_gate(torch.cat([h_attr3, h_attr3], dim=1)),
-            self.fusion_gate(torch.cat([h_attr4, h_attr4], dim=1)),
-        ]
-        fused = torch.cat([h_attr1, h_attr2, h_attr3, h_attr4], dim=1)
-        anchor, curvature = shared_text_anchor(fused, (
-            self.prompt_guidance_1, self.prompt_guidance_2,
-            self.prompt_guidance_3, self.prompt_guidance_4,
-        ))
-        gate_control = torch.cat(gates, dim=1).mean(
-            dim=1, keepdim=True
-        ).view(b, 1, 1, 1)
-
-        self.isss = self.isss + 1
-
-        x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A) #4:[384,12,12] 3:[192,24,24] 2:[96,48,48] 1:[48,96,96]
-        x4_B, x3_B, x2_B, x1_B = self.encoder_B(inp_img_B)
-
-        x4_A = self.attention_spatial(x4_A)
-        x4_B = self.attention_spatial(x4_B)
-        x4_A, x4_B = self.cross_attention(x4_A, x4_B)
-        x4 = self.feature_fusion_4(x4_A, x4_B)
-        x4 = self._apply_weak_tiam(
-            x4, anchor, curvature, gate_control, self.prompt_guidance_4
-        )
-        inp4 = x4
-        outd4 = self.decoder_level4(inp4)
-
-        inp3 = self.up4_3(outd4)
-        inp3 = self._apply_weak_tiam(
-            inp3, anchor, curvature, gate_control, self.prompt_guidance_3
-        )
-        x3 = self.feature_fusion_3(x3_A, x3_B)
-        inp31 = torch.cat([inp3, x3], 1)
-        inp31 = self.reduce_chan_level3(inp31)
-        outd31 = self.decoder_level3(inp31)
-
-        inp2 = self.up3_2(outd31)
-        inp2 = self._apply_weak_tiam(
-            inp2, anchor, curvature, gate_control, self.prompt_guidance_2
-        )
-        x2 = self.feature_fusion_2(x2_A, x2_B)
-        inp21 = torch.cat([x2, self.up3_2(x3)], 1)
-        inp22 = torch.cat([inp21,x2,inp2], 1)
-        inp22 = self.reduce_chan_level2(inp22)
-        outd22 = self.decoder_level2(inp22)
-
-        inp1 = self.up2_1(outd22)
-        inp1 = self._apply_weak_tiam(
-            inp1, anchor, curvature, gate_control, self.prompt_guidance_1
-        )
-        x1 = self.feature_fusion_1(x1_A, x1_B)
-        inp11 = torch.cat([x1, self.up2_1(x2)], 1)
-
-        inp12 = torch.cat([x1, inp11, self.up2_1_2(inp21)], 1)
-        inp13 = torch.cat([x1, inp11, inp12, inp1], 1)
-
-        inp13 = self.reduce_chan_level1(inp13)
-
-        outd1 = self.decoder_level1(inp13)
-
-        outd1 = self.refinement(outd1)
-
-
-
-        outd1 = self.output1(outd1)
-        outd1 = self.output2(outd1)
-        outd1 = self.output3(outd1)
-        outd1 = self.output4(outd1)
-        return outd1
+    def forward(self, inp_img_A, inp_img_B, feature):
+        return self.forward_inference(inp_img_A, inp_img_B, feature)
 
     @torch.no_grad()
     def get_text_feature(self, text):

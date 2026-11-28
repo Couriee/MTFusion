@@ -15,9 +15,10 @@ from skimage.feature import graycomatrix
 from skimage import io
 
 from scripts.image_output import existing_image_names, reserve_image_stem, write_image
+from scripts.inference import pad_image_pair, crop_to_original
+from scripts.training_state import make_schedule_plan, polynomial_lr_factor
 from scripts.losses import fusion_prompt_loss
 import torch
-from transformers import BlipProcessor, BlipForConditionalGeneration
 from torchvision.transforms.functional import to_pil_image
 from args_fusion import args
 
@@ -38,6 +39,7 @@ BLIP_MODEL_PATH = os.environ.get(
 
 def load_local_blip():
     """Load BLIP exclusively from a local directory or the local HF cache."""
+    from transformers import BlipProcessor, BlipForConditionalGeneration
     model_source = os.path.expandvars(os.path.expanduser(BLIP_MODEL_PATH))
     if model_source != BLIP_MODEL_ID:
         model_source = os.path.abspath(model_source)
@@ -139,15 +141,12 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
                     grad_clip_norm=1.0):
     processor, model_text = load_local_blip()
 
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device)
     model_text = model_text.to(device)
 
     model.train()
     model_clip.eval()
-    loss_function_prompt = fusion_prompt_loss()
-
-    if torch.cuda.is_available():
-        loss_function_prompt = loss_function_prompt.to(device)
+    loss_function_prompt = fusion_prompt_loss().to(device)
 
     accu_total_loss = torch.zeros(1).to(device)
     accu_ssim_loss = torch.zeros(1).to(device)
@@ -172,7 +171,7 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         inputs1 = inputs1.to(device)
         out1 = model_text.generate(**inputs1)  # 生成文本描述
         captions1 = processor.batch_decode(out1, skip_special_tokens=True)
-        text1 = clip.tokenize(captions1).to(args.device)
+        text1 = clip.tokenize(captions1).to(device)
         # print(text1)
 
         # 批量处理
@@ -183,7 +182,7 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         inputs2 = inputs2.to(device)
         out2 = model_text.generate(**inputs2)  # 生成文本描述
         captions2 = processor.batch_decode(out2, skip_special_tokens=True)
-        text2 = clip.tokenize(captions2).to(args.device)
+        text2 = clip.tokenize(captions2).to(device)
 
 
         _check_rgb_batch(I_A)
@@ -214,11 +213,10 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         )
 
 
-        if torch.cuda.is_available():
-            I_A = I_A.to(device)
-            I_B = I_B.to(device)
-            I_A_gt = I_A_gt.to(device)
-            I_B_gt = I_B_gt.to(device)
+        I_A = I_A.to(device)
+        I_B = I_B.to(device)
+        I_A_gt = I_A_gt.to(device)
+        I_B_gt = I_B_gt.to(device)
 
         feature = feature.to(I_A.device)
 
@@ -272,14 +270,10 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
 
 @torch.no_grad()
 def evaluate(model, data_loader, device, epoch, lr, filefold_path):
-    processor, model_text = load_local_blip()
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    model_text = model_text.to(device)
-
-    loss_function_prompt = fusion_prompt_loss()
-
-
     model.eval()
+    deployment_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    device = torch.device(device)
+    loss_function_prompt = fusion_prompt_loss().to(device)
     accu_total_loss = torch.zeros(1).to(device)
     accu_ssim_loss = torch.zeros(1).to(device)
     accu_max_loss = torch.zeros(1).to(device)
@@ -293,9 +287,6 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
     save_RGB_fuse = True
     output_endings = (".png", "vis.png", "ir.png") if save_RGB_fuse else (".png",)
 
-    if torch.cuda.is_available():
-        loss_function_prompt = loss_function_prompt.to(device)
-
     if epoch % save_epoch == 0:
         evalfold_path = os.path.join(filefold_path, str(epoch))
         os.makedirs(evalfold_path, exist_ok=True)
@@ -304,31 +295,6 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
     data_loader = tqdm(data_loader, file=sys.stdout)
     for step, data in enumerate(data_loader):
         I_A, I_B, I_A_gt, I_B_gt, I_full, task, name = data
-        text_line = []
-
-        # 批量处理
-        batch_images1 = [to_pil_image(img) for img in I_A]  # 将每个张量转换为 PIL 图像
-        ###################################################################################################
-        # 使用 Blip 生成文本描述
-        inputs1 = processor(batch_images1, return_tensors="pt")  # 处理批量图像
-        inputs1 = inputs1.to(device)
-        out1 = model_text.generate(**inputs1)  # 生成文本描述
-        captions1 = processor.batch_decode(out1, skip_special_tokens=True)
-        text1 = clip.tokenize(captions1).to(args.device)
-        # print(text1)
-
-        # 批量处理
-        batch_images2 = [to_pil_image(img) for img in I_B]  # 将每个张量转换为 PIL 图像
-
-        # 使用 Blip 生成文本描述
-        inputs2 = processor(batch_images2, return_tensors="pt")  # 处理批量图像
-        inputs2 = inputs2.to(device)
-        out2 = model_text.generate(**inputs2)  # 生成文本描述
-        captions2 = processor.batch_decode(out2, skip_special_tokens=True)
-        text2 = clip.tokenize(captions2).to(args.device)
-
-        ####################################################################################################
-
         _check_rgb_batch(I_A)
         _check_rgb_batch(I_B)
         if I_A.shape != I_B.shape:
@@ -357,18 +323,16 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
         )
 
 
-        if torch.cuda.is_available():
-            I_A = I_A.to(device)
-            I_B = I_B.to(device)
-            I_A_gt = I_A_gt.to(device)
-            I_B_gt = I_B_gt.to(device)
-            I_full = I_full.to(device)
-
-        feature = feature.to(I_A.device)
-
-
-
-        I_fused,htext,hattr,distance_all = model(I_A, I_B, text1,text2, feature)
+        I_A, I_B = I_A.to(device), I_B.to(device)
+        I_A_gt, I_B_gt = I_A_gt.to(device), I_B_gt.to(device)
+        I_full = I_full.to(device)
+        feature = feature.to(device)
+        # Attributes describe the original image, not its artificial padding.
+        I_A, I_B, original_size = pad_image_pair(I_A, I_B)
+        I_fused, htext, hattr, distance_all = deployment_model.forward_inference(
+            I_A, I_B, feature, return_details=True
+        )
+        I_fused = crop_to_original(I_fused, original_size)
 
         if epoch % save_epoch == 0:
             if cnt <= save_length:
@@ -421,19 +385,15 @@ def create_lr_scheduler(optimizer,
                         epochs: int,
                         warmup=True,
                         warmup_epochs=1,
-                        warmup_factor=1e-3):
-    assert num_step > 0 and epochs > 0
-    if warmup is False:
-        warmup_epochs = 0
-
-    def f(x):
-        if warmup is True and x <= (warmup_epochs * num_step):
-            alpha = float(x) / (warmup_epochs * num_step)
-            return warmup_factor * (1 - alpha) + alpha
-        else:
-            return (1 - (x - warmup_epochs * num_step) / ((epochs - warmup_epochs) * num_step)) ** 0.9
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=f)
+                        warmup_factor=1e-3,
+                        plan=None):
+    if plan is None:
+        plan = make_schedule_plan(num_step, epochs, warmup, warmup_epochs, warmup_factor)
+    if plan["steps_per_epoch"] != num_step or plan["total_epochs"] != epochs:
+        raise ValueError("Scheduler plan does not match the requested loader and epoch count.")
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda step: polynomial_lr_factor(step, plan)
+    )
 
 
 def save_pic(outputpic, path, index: str):

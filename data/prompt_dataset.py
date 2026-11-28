@@ -3,11 +3,12 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import random
+from scripts.validation import select_validation_samples
 
 class PromptDataSet(Dataset):
     def __init__(self, train_low_light_path_list, val_low_light_path_list, train_over_exposure_path_list, val_over_exposure_path_list,
                  train_ir_low_contrast_path_list, val_ir_low_contrast_path_list, train_ir_noise_path_list, val_ir_noise_path_list,
-                 phase="train", transform=None, samples_per_epoch=800, max_val_samples=80):
+                 phase="train", transform=None, samples_per_epoch=800, max_val_samples=0):
         self.phase = phase
         if phase == "train":
             self.paths = {
@@ -70,16 +71,8 @@ class PromptDataSet(Dataset):
 
         self.num_unique_pairs = sum(self.task_lengths.values())
         self.samples_per_epoch = int(samples_per_epoch)
-        all_val_samples = [
-            (task_key, image_index)
-            for task_key in self.task_keys
-            for image_index in range(self.task_lengths[task_key])
-        ]
-        max_val_samples = int(max_val_samples)
-        self.val_samples = (
-            all_val_samples[:max_val_samples]
-            if max_val_samples > 0
-            else all_val_samples
+        self.val_samples = select_validation_samples(
+            self.task_keys, self.task_lengths, int(max_val_samples)
         )
 
     def __len__(self):
@@ -105,6 +98,10 @@ class PromptDataSet(Dataset):
 
         image_A = Image.open(image_A_path).convert(mode='RGB')
         image_B = Image.open(image_B_path).convert(mode='RGB')
+        if image_A.size != image_B.size:
+            raise ValueError("Paired images must have the same original size: {} {} vs {} {}".format(
+                image_A_path, image_A.size, image_B_path, image_B.size
+            ))
         image_A_gt = image_A.copy()
         image_B_gt = image_B.copy()
         image_full = image_A.copy()
